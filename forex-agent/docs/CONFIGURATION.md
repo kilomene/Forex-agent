@@ -35,9 +35,17 @@ no casual path to live trading.
 | — | `MT5_PASSWORD` * | — | required in live mode |
 | — | `MT5_SERVER` * | — | e.g. `Exness-MT5Trial8`; required in live mode |
 | — | `MT5_TERMINAL_PATH` | — | optional path to `terminal64.exe` |
+| — | `MT5_GATEWAY_URL` | — | remote MT5 gateway host, e.g. `https://mt5-gw.example.com`; when set, `MT5Adapter` routes all operations through the remote gateway transport (see `broker/mt5/RUNTIME.md`, `broker/mt5/gateway_contract.md`) |
+| — | `MT5_GATEWAY_TOKEN` | — | bearer token for the remote gateway (**required** when `MT5_GATEWAY_URL` is set; unauthenticated remote use is refused) |
+| — | `MT5_ALLOW_NONWINDOWS_RUNTIME` | — | set to `1` to silence the platform warning when running under a Wine-compatible runtime (best effort, unsupported) |
 
 `disconnected` lets the whole subsystem import and run on Linux with no
 broker (analysis works; trading calls raise `BROKER_UNAVAILABLE`).
+
+`scripts/forex broker-status` (and `GET /status` on the local API) reports
+the structured broker runtime status: `configured` / `reachable` /
+`connected` / `account_available` / `market_data_available` /
+`trading_available` — field reference in `broker/mt5/RUNTIME.md`.
 
 ## account
 

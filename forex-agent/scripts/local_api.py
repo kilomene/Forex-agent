@@ -64,11 +64,18 @@ def _status_payload() -> dict:
     health = registry.call("forex.get_health", {})
     account = registry.call("forex.get_account", {})
     positions = registry.call("forex.get_positions", {})
+    try:
+        from agent.tools.backend import broker_adapter  # noqa: PLC0415
+        broker_status = broker_adapter().broker_status().get("broker")
+    except Exception as exc:  # status endpoint must never fail on this
+        broker_status = {"provider": "unknown", "configured": False,
+                         "detail": {"reason": str(exc)[:200]}}
     return {
         "ok": bool(health.get("ok")),
         "status": health.get("status"),
         "kill_switch_engaged": health.get("components", {}).get(
             "kill_switch", {}).get("detail", {}).get("engaged"),
+        "broker_status": broker_status,
         "equity": (account.get("account") or {}).get("equity"),
         "currency": (account.get("account") or {}).get("currency"),
         "open_positions": positions.get("count"),
