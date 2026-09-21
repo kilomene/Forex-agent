@@ -8,6 +8,7 @@ the output is a compact human-readable summary. Exit codes: 0 ok,
 Commands:
   status                      one-line subsystem summary
   health                      full component health (forex.get_health)
+  broker-status               structured broker runtime status
   signals [--status S] [--limit N]
   signal <signal_id>
   positions
@@ -15,7 +16,7 @@ Commands:
   analyze <symbol> [--timeframe TF]
   risk [--symbol S --direction D --lot-size V --stop-distance X]
   performance [--lookback-days N]
-  events [--limit N] [--since ISO]
+  events [--limit N] [--since ISO] [--since-id EVENT_ID] [--follow]
   config                      effective config (secrets redacted)
   kill-switch [--engage|--clear] [--reason TEXT]
 
@@ -88,6 +89,13 @@ def cmd_health(args) -> int:
     return _out(registry.call("forex.get_health", {}), args.json)
 
 
+def cmd_broker_status(args) -> int:
+    """Structured broker runtime status (never raises). Uses the
+    configured broker adapter directly — no trade-affecting calls."""
+    from agent.tools.backend import broker_adapter  # noqa: PLC0415
+    return _out({"ok": True, **broker_adapter().broker_status()}, args.json)
+
+
 def cmd_signals(args) -> int:
     params = {"limit": args.limit}
     if args.status:
@@ -133,13 +141,48 @@ def cmd_performance(args) -> int:
 
 
 def cmd_events(args) -> int:
-    from agent.events.bus import poll  # noqa: PLC0415
+    from agent.events import bus  # noqa: PLC0415
+    if getattr(args, "follow", False):
+        return _follow_events(args)
     try:
-        events = poll(limit=args.limit, since=args.since)
+        if getattr(args, "since_id", None):
+            events = bus.replay_after(args.since_id, limit=args.limit)
+        else:
+            events = bus.poll(limit=args.limit, since=args.since)
     except ValueError as exc:
         return _out({"ok": False, "error_code": "INVALID_ARGUMENT",
                      "message": str(exc)}, args.json)
+    except RuntimeError as exc:
+        return _out({"ok": False, "error_code": "INTERNAL_ERROR",
+                     "message": str(exc)}, args.json)
     return _out({"ok": True, "count": len(events), "events": events}, args.json)
+
+
+def _follow_events(args) -> int:
+    """Tail the delivery journal like `tail -f`: print each new event as
+    one JSON line, starting after the current journal head (or after
+    --since-id). Ctrl-C stops. Same journal the SSE stream reads, so this
+    sees daemon-published events too."""
+    import time  # noqa: PLC0415
+    from agent.events import bus  # noqa: PLC0415
+    try:
+        cursor = args.since_id or bus.last_event_id()
+        while True:
+            events = (bus.replay_after(cursor, limit=200) if cursor
+                      else bus.latest_events(limit=50))
+            for event in events:
+                print(json.dumps(event, default=str), flush=True)
+                cursor = event["event_id"]
+            time.sleep(1.0)
+    except ValueError as exc:
+        return _out({"ok": False, "error_code": "INVALID_ARGUMENT",
+                     "message": str(exc)}, args.json)
+    except RuntimeError as exc:
+        return _out({"ok": False, "error_code": "INTERNAL_ERROR",
+                     "message": str(exc)}, args.json)
+    except KeyboardInterrupt:
+        pass
+    return 0
 
 
 def _redact(value):
@@ -198,6 +241,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp("status").set_defaults(func=cmd_status)
     sp("health").set_defaults(func=cmd_health)
+    sp("broker-status").set_defaults(func=cmd_broker_status)
 
     p = sp("signals")
     p.add_argument("--status", default=None)
@@ -229,7 +273,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sp("events")
     p.add_argument("--limit", type=int, default=20)
-    p.add_argument("--since", default=None)
+    p.add_argument("--since", default=None,
+                   help="ISO-8601 timestamp lower bound (one-shot poll)")
+    p.add_argument("--since-id", default=None,
+                   help="event_id to replay after (delivery journal, one-shot)")
+    p.add_argument("--follow", action="store_true",
+                   help="tail new events as JSON lines until Ctrl-C")
     p.set_defaults(func=cmd_events)
 
     sp("config").set_defaults(func=cmd_config)
