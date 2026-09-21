@@ -78,3 +78,17 @@ class DisconnectedAdapter(BrokerAdapter):
             server_time=datetime.now(),
             message=self._MSG,
         )
+
+    def broker_status(self) -> dict:
+        """Structured status: nothing is configured, so every capability
+        flag is False. Honest by construction — no probes, no fake data."""
+        return {"broker": {
+            "provider": "disconnected",
+            "configured": False,
+            "reachable": False,
+            "connected": False,
+            "account_available": False,
+            "market_data_available": False,
+            "trading_available": False,
+            "detail": {"reason": "No broker configured (provider=disconnected)."},
+        }}

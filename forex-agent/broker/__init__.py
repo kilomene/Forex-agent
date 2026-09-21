@@ -9,7 +9,8 @@ Error model: adapter methods return their dataclass on success and raise
 BrokerError carrying a structured code on failure. Structured codes:
     BROKER_UNAVAILABLE, MT5_NOT_CONNECTED, INVALID_SYMBOL, MARKET_CLOSED,
     RISK_LIMIT_EXCEEDED, DAILY_LOSS_LIMIT, MAX_EXPOSURE, INVALID_ORDER,
-    CONFIG_INVALID, CREDENTIALS_INVALID
+    CONFIG_INVALID, CREDENTIALS_INVALID,
+    GATEWAY_UNREACHABLE, GATEWAY_AUTH_FAILED, GATEWAY_REJECTED
 (These codes are shared with the execution gateway's reject reasons.)
 
 Bot-identity convention (ported from mt5_shared.py): this bot's own
@@ -40,6 +41,11 @@ MAX_EXPOSURE = "MAX_EXPOSURE"
 INVALID_ORDER = "INVALID_ORDER"
 CONFIG_INVALID = "CONFIG_INVALID"
 CREDENTIALS_INVALID = "CREDENTIALS_INVALID"
+# Remote MT5 gateway transport failures (broker/mt5/gateway.py).
+GATEWAY_UNREACHABLE = "GATEWAY_UNREACHABLE"  # gateway host not reachable / timed out
+GATEWAY_AUTH_FAILED = "GATEWAY_AUTH_FAILED"  # missing/invalid bearer token
+GATEWAY_REJECTED = "GATEWAY_REJECTED"        # op not in the defined set, or
+                                            # malformed gateway response
 
 
 class BrokerError(Exception):
@@ -276,3 +282,54 @@ class BrokerAdapter(abc.ABC):
         checks; adapters that cannot provide it return None and the
         gateway skips those checks (recorded in the audit log)."""
         return None
+
+    # -- structured runtime status ----------------------------------------
+    def broker_status(self) -> dict:
+        """Structured broker runtime status. NEVER raises.
+
+        Shape (keys stable; see broker/mt5/RUNTIME.md for field docs):
+            {"broker": {"provider": ..., "configured": ...,
+                        "reachable": ..., "connected": ...,
+                        "account_available": ..., "market_data_available": ...,
+                        "trading_available": ..., "detail": {...}}}
+
+        Granular on purpose: "configured" (a broker is selected) is not
+        "reachable" (its runtime answers), which is not "connected"
+        (logged in), which is not "trading_available" (terminal allows
+        trading). Adapters override this for transport-aware probing;
+        the base implementation probes conservatively through the public
+        interface and degrades every flag to False on failure.
+        """
+        status = {
+            "provider": getattr(self, "adapter_name", "unknown"),
+            "configured": True,
+            "reachable": False,
+            "connected": False,
+            "account_available": False,
+            "market_data_available": False,
+            "trading_available": False,
+            "detail": {},
+        }
+        try:
+            try:
+                h = self.health()
+                connected = bool(getattr(h, "connected", False))
+            except Exception:
+                connected = False
+            status["connected"] = connected
+            # Base implementation cannot distinguish "runtime answers"
+            # from "logged in"; transport-aware adapters override this.
+            status["reachable"] = connected
+            try:
+                self.account_info()
+                status["account_available"] = True
+            except Exception:
+                pass
+            try:
+                syms = self.symbols()
+                status["market_data_available"] = bool(syms)
+            except Exception:
+                pass
+        except Exception as exc:  # defensive: status must never raise
+            status["detail"]["probe_error"] = str(exc)[:200]
+        return {"broker": status}

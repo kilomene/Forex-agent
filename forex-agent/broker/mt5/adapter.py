@@ -1,5 +1,6 @@
 """
-MT5Adapter — implements BrokerAdapter against a local MT5 terminal.
+MT5Adapter — implements BrokerAdapter against a local MT5 terminal
+or a remote MT5 gateway host.
 
 This is the ONLY place `import MetaTrader5` may appear in the whole
 project. It absorbs BOTH original dialects:
@@ -9,6 +10,19 @@ project. It absorbs BOTH original dialects:
     reconciliation.py (positions_get, history_deals_get) and
     performance_review.py / cost_tracking.py (deal history)
 
+Transports (see broker/mt5/RUNTIME.md and gateway_contract.md):
+  * LOCAL (default): direct MetaTrader5 calls. Only meaningful where a
+    compatible runtime exists (Windows host + terminal, or a
+    Wine-compatible runtime). On Linux without one, every operation
+    raises BrokerError(BROKER_UNAVAILABLE) — honest, never fake.
+  * REMOTE: when the MT5_GATEWAY_URL env var is set (token via
+    MT5_GATEWAY_TOKEN), all operations route through
+    broker/mt5/gateway.py's RemoteMT5GatewayTransport: a FIXED,
+    authenticated operation set over HTTP. No arbitrary commands, ever.
+
+The BrokerAdapter method signatures are unchanged — the Forex core keeps
+calling BrokerAdapter and never knows which transport is underneath.
+
 Graceful degradation: if the MetaTrader5 package is missing (Linux),
 importing this module still works; every broker operation raises
 BrokerError(BROKER_UNAVAILABLE) via _require_mt5(). Never raises at
@@ -16,6 +30,8 @@ import time.
 """
 
 import logging
+import os
+import sys
 from datetime import datetime
 from typing import List, Optional
 
@@ -39,25 +55,55 @@ from broker import (
     SymbolSpec,
     BROKER_UNAVAILABLE,
     CREDENTIALS_INVALID,
+    GATEWAY_AUTH_FAILED,
+    GATEWAY_UNREACHABLE,
     INVALID_ORDER,
     INVALID_SYMBOL,
     MARKET_CLOSED,
     MT5_NOT_CONNECTED,
     CONFIG_INVALID,
 )
+from broker.mt5.gateway import RemoteMT5GatewayTransport
 from broker.mt5.shared import extract_signal_id_from_comment  # noqa: F401  (kept for adapter-internal use)
 from core.market import Candle
 
 logger = logging.getLogger("broker.mt5")
 
+# Set to "1" to silence the non-Windows platform warning when you run a
+# Wine-compatible MT5 runtime (unsupported; see broker/mt5/RUNTIME.md).
+NONWINDOWS_RUNTIME_ENV = "MT5_ALLOW_NONWINDOWS_RUNTIME"
+
 
 def _require_mt5():
+    """Guard every direct-MetaTrader5 call.
+
+    Windows-specific assumptions isolated here:
+      1. The MetaTrader5 package ships Windows-only wheels. On Linux the
+         import fails -> BROKER_UNAVAILABLE with an explicit message
+         (pip install MetaTrader5 != a working MT5; see RUNTIME.md).
+      2. Even with the package present (Wine), the calls below assume a
+         real terminal (terminal64.exe) behind them. On non-Windows we
+         log a warning rather than fail, because Wine runtimes exist;
+         RUNTIME.md documents the supported configurations.
+    """
     if mt5 is None:
         raise BrokerError(
             BROKER_UNAVAILABLE,
-            "The MetaTrader5 package is not installed on this machine "
-            "(Windows + MT5 terminal required). Core runs brokerless; "
-            "use DisconnectedAdapter or connect a broker host.",
+            "MetaTrader5 is not available on this machine: the MetaTrader5 "
+            "package is not installed (it ships Windows-only wheels — "
+            "'pip install MetaTrader5' on Linux does NOT create a working "
+            "MT5 environment). Real MT5 needs a Windows host / "
+            "Wine-compatible runtime with an MT5 terminal, or a remote "
+            "gateway host (MT5_GATEWAY_URL). See broker/mt5/RUNTIME.md.",
+            detail={"reason": "mt5_package_missing"},
+        )
+    if sys.platform != "win32" and os.environ.get(NONWINDOWS_RUNTIME_ENV) != "1":
+        logger.warning(
+            "MetaTrader5 calls on non-Windows platform %r without a declared "
+            "compatible runtime. Real MT5 needs a Windows host, a "
+            "Wine-compatible runtime (%s=1), or a remote gateway "
+            "(MT5_GATEWAY_URL). See broker/mt5/RUNTIME.md.",
+            sys.platform, NONWINDOWS_RUNTIME_ENV,
         )
     return mt5
 
@@ -82,13 +128,44 @@ def _timeframe(name: str):
 class MT5Adapter(BrokerAdapter):
     adapter_name = "mt5"
 
-    def __init__(self):
+    def __init__(self, transport=None):
+        """transport: an MT5Transport (see broker/mt5/gateway.py). When None
+        and the MT5_GATEWAY_URL env var is set, a RemoteMT5GatewayTransport
+        is built (token from MT5_GATEWAY_TOKEN, required). Otherwise the
+        local direct-MetaTrader5 path is used."""
         self._connected = False
         self._login: Optional[int] = None
         self._server: str = ""
+        if transport is None:
+            gw_url = (os.environ.get("MT5_GATEWAY_URL") or "").strip()
+            if gw_url:
+                transport = RemoteMT5GatewayTransport(gw_url)
+        self._transport = transport  # None -> local direct-mt5 path
+
+    @property
+    def transport_mode(self) -> str:
+        """'remote' when routing through the HTTP gateway, else 'local'."""
+        return "remote" if self._transport is not None else "local"
+
+    def _ensure_remote(self):
+        if self._transport is None:  # pragma: no cover - internal guard
+            raise BrokerError(CONFIG_INVALID, "No remote transport configured.")
+        if not self._connected:
+            raise BrokerError(MT5_NOT_CONNECTED, "Not connected — call connect() first.")
+        return self._transport
 
     # -- lifecycle ------------------------------------------------------
     def connect(self, creds: dict) -> None:
+        if self._transport is not None:
+            # Remote gateway: the bearer token IS the auth; ping() validates
+            # reachability + credentials and raises GATEWAY_UNREACHABLE /
+            # GATEWAY_AUTH_FAILED with detail on failure.
+            self._transport.check()
+            self._connected = True
+            logger.info("Connected to remote MT5 gateway via %s.",
+                        getattr(self._transport, "base_url",
+                                type(self._transport).__name__))
+            return
         m = _require_mt5()
         login = creds.get("login")
         password = creds.get("password")
@@ -128,6 +205,8 @@ class MT5Adapter(BrokerAdapter):
 
     # -- account ---------------------------------------------------------
     def account_info(self) -> AccountInfo:
+        if self._transport is not None:
+            return self._ensure_remote().account_info()
         m = self._ensure()
         info = m.account_info()
         if info is None:
@@ -145,6 +224,8 @@ class MT5Adapter(BrokerAdapter):
 
     # -- market data ------------------------------------------------------
     def symbols(self, names: Optional[List[str]] = None) -> List[SymbolSpec]:
+        if self._transport is not None:
+            return self._ensure_remote().symbols(names)
         m = self._ensure()
         if names is None:
             all_syms = m.symbols_get()
@@ -169,6 +250,8 @@ class MT5Adapter(BrokerAdapter):
 
     def candles(self, symbol: str, timeframe: str, count: int = 200) -> List[Candle]:
         """CLOSED candles only: fetches count+1 and drops the forming one."""
+        if self._transport is not None:
+            return self._ensure_remote().candles(symbol, timeframe, count)
         m = self._ensure()
         tf = _timeframe(timeframe)
         if not m.symbol_select(symbol, True):
@@ -190,6 +273,8 @@ class MT5Adapter(BrokerAdapter):
         ]
 
     def quote(self, symbol: str) -> Optional[Quote]:
+        if self._transport is not None:
+            return self._ensure_remote().quote(symbol)
         m = self._ensure()
         tick = m.symbol_info_tick(symbol)
         if tick is None:
@@ -202,6 +287,8 @@ class MT5Adapter(BrokerAdapter):
         return "BUY" if type_value == m.ORDER_TYPE_BUY else "SELL"
 
     def positions(self) -> List[Position]:
+        if self._transport is not None:
+            return self._ensure_remote().positions()
         m = self._ensure()
         raw = m.positions_get()
         if raw is None:
@@ -227,6 +314,8 @@ class MT5Adapter(BrokerAdapter):
         return out
 
     def orders(self) -> List[Order]:
+        if self._transport is not None:
+            return self._ensure_remote().orders()
         m = self._ensure()
         raw = m.orders_get()
         if raw is None:
@@ -257,6 +346,15 @@ class MT5Adapter(BrokerAdapter):
     def submit_order(self, req: OrderRequest) -> OrderResult:
         """Broker-confirmed only: returns OrderResult solely on
         TRADE_RETCODE_DONE; every other outcome raises BrokerError."""
+        if self._transport is not None:
+            t = self._ensure_remote()
+            if req.direction not in ("BUY", "SELL"):
+                raise BrokerError(INVALID_ORDER, f"direction must be BUY|SELL, got {req.direction!r}")
+            if req.volume <= 0:
+                raise BrokerError(INVALID_ORDER, f"volume must be positive, got {req.volume}")
+            if req.stop_loss is None:
+                raise BrokerError(INVALID_ORDER, "stop_loss is required")
+            return t.submit_order(req)
         m = self._ensure()
         if req.direction not in ("BUY", "SELL"):
             raise BrokerError(INVALID_ORDER, f"direction must be BUY|SELL, got {req.direction!r}")
@@ -317,6 +415,9 @@ class MT5Adapter(BrokerAdapter):
 
     def modify_order(self, ticket: int, sl: float, tp: float) -> None:
         """SLTP modify (absorbs exit_manager._modify_sl's direct mt5 call)."""
+        if self._transport is not None:
+            self._ensure_remote().modify_position(ticket, sl, tp)
+            return
         m = self._ensure()
         pos = self._find_position(m, ticket)
         request = {
@@ -337,6 +438,8 @@ class MT5Adapter(BrokerAdapter):
     def close_position(self, ticket: int) -> float:
         """Market close (absorbs exit_manager.close_position's direct mt5
         call). Returns the broker-confirmed close price."""
+        if self._transport is not None:
+            return self._ensure_remote().close_position(ticket)
         m = self._ensure()
         pos = self._find_position(m, ticket)
         close_type = m.ORDER_TYPE_SELL if pos.direction == "BUY" else m.ORDER_TYPE_BUY
@@ -370,6 +473,8 @@ class MT5Adapter(BrokerAdapter):
     def deal_history(
         self, from_: datetime, to: datetime, position_id: Optional[int] = None
     ) -> List[Deal]:
+        if self._transport is not None:
+            return self._ensure_remote().deal_history(from_, to, position_id)
         m = self._ensure()
         if position_id is not None:
             raw = m.history_deals_get(position=position_id)
@@ -406,6 +511,20 @@ class MT5Adapter(BrokerAdapter):
 
     # -- health -----------------------------------------------------------------
     def health(self) -> BrokerHealth:
+        if self._transport is not None:
+            try:
+                up = self._transport.ping()
+            except Exception as exc:  # never let health checks raise
+                return BrokerHealth(connected=False, adapter=self.adapter_name,
+                                    message=f"gateway error: {exc}")
+            return BrokerHealth(
+                connected=bool(self._connected and up),
+                adapter=self.adapter_name,
+                server_time=datetime.now(),
+                message="" if (self._connected and up) else
+                        ("gateway reachable, not connected" if up
+                         else "gateway unreachable"),
+            )
         if mt5 is None:
             return BrokerHealth(
                 connected=False, adapter=self.adapter_name,
@@ -421,3 +540,102 @@ class MT5Adapter(BrokerAdapter):
             )
         except Exception as exc:  # never let health checks raise
             return BrokerHealth(connected=False, adapter=self.adapter_name, message=str(exc))
+
+    # -- structured runtime status ------------------------------------------
+    def broker_status(self) -> dict:
+        """Transport-aware structured status. Never raises. Field docs:
+        broker/mt5/RUNTIME.md."""
+        try:
+            return {"broker": self._mt5_status()}
+        except Exception as exc:  # defensive: status must never raise
+            return {"broker": {
+                "provider": "mt5", "mode": self.transport_mode,
+                "configured": True, "reachable": False, "connected": False,
+                "account_available": False, "market_data_available": False,
+                "trading_available": False,
+                "detail": {"probe_error": str(exc)[:200]},
+            }}
+
+    def _mt5_status(self) -> dict:
+        status = {
+            "provider": "mt5",
+            "mode": self.transport_mode,
+            "configured": True,
+            "reachable": False,
+            "connected": False,
+            "account_available": False,
+            "market_data_available": False,
+            "trading_available": False,
+            "detail": {},
+        }
+        if self._transport is not None:
+            return self._remote_status(status)
+        # -- local path --------------------------------------------------
+        if mt5 is None:
+            status["detail"]["reason"] = (
+                "MetaTrader5 package not installed on this machine "
+                "(see broker/mt5/RUNTIME.md)")
+            return status
+        status["reachable"] = True
+        if sys.platform != "win32":
+            status["detail"]["platform"] = (
+                f"{sys.platform}: no Windows terminal runtime declared "
+                "(set MT5_ALLOW_NONWINDOWS_RUNTIME=1 for Wine)")
+        if not self._connected:
+            status["detail"]["reason"] = "runtime present, not connected (call connect())"
+            return status
+        try:
+            self.account_info()
+            status["account_available"] = True
+            status["connected"] = True
+        except BrokerError as exc:
+            status["detail"]["account"] = exc.message
+            return status
+        try:
+            if self.symbols():
+                status["market_data_available"] = True
+        except BrokerError as exc:
+            status["detail"]["market_data"] = exc.message
+        try:
+            ti = mt5.terminal_info()
+            status["trading_available"] = bool(
+                ti is not None and getattr(ti, "trade_allowed", False))
+            if not status["trading_available"]:
+                status["detail"]["trading"] = "terminal reports trade_allowed=false"
+        except Exception as exc:
+            status["detail"]["trading"] = f"terminal_info failed: {exc}"[:120]
+        return status
+
+    def _remote_status(self, status: dict) -> dict:
+        t = self._transport
+        try:
+            reachable = bool(t.ping())
+        except BrokerError as exc:
+            status["detail"]["reason"] = f"gateway unreachable: {exc.message}"
+            return status
+        status["reachable"] = reachable
+        if not reachable:
+            status["detail"]["reason"] = "gateway unreachable (see broker/mt5/RUNTIME.md)"
+            return status
+        if not self._connected:
+            status["detail"]["reason"] = "gateway reachable, not connected (call connect())"
+            return status
+        status["connected"] = True
+        try:
+            t.account_info()
+            status["account_available"] = True
+        except BrokerError as exc:
+            status["detail"]["account"] = exc.message
+        try:
+            if t.symbols():
+                status["market_data_available"] = True
+        except BrokerError as exc:
+            status["detail"]["market_data"] = exc.message
+        try:
+            term = t.terminal_status()
+            status["trading_available"] = bool(term.get("trade_allowed", False))
+            if not status["trading_available"]:
+                status["detail"]["trading"] = "terminal reports trade_allowed=false"
+        except BrokerError as exc:
+            status["detail"]["trading"] = exc.message
+        return status
