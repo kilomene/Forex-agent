@@ -1,0 +1,110 @@
+# forex-agent — default configuration.
+#
+# This file holds every NON-SECRET setting. Secrets (MT5_LOGIN,
+# MT5_PASSWORD, MT5_SERVER, WORKER_API_KEY) come from environment
+# variables or a 0600 secrets file (see FOREX_SECRETS_FILE) — never here,
+# never in code, never in logs.
+#
+# Environment variables override anything in this file. See config.py
+# for the full env-var → setting map (original bridge keys preserved).
+
+# dry_run | live
+# dry_run is the default and blocks ALL live orders at the execution
+# gateway. Switching to live requires deliberately editing this (or
+# setting DRY_RUN=false / MODE=live) AND providing broker credentials.
+mode: dry_run
+
+broker:
+  provider: mt5  # mt5 | disconnected
+  # MT5 credentials: env MT5_LOGIN / MT5_PASSWORD / MT5_SERVER
+  # (MT5_TERMINAL_PATH optional). Required only in live mode.
+
+symbols:
+  - EURUSD
+  - GBPUSD
+  - USDJPY
+  - AUDUSD
+
+timeframes:
+  - H1
+
+strategies:
+  ema_rsi:
+    enabled: true
+    ema_fast: 20
+    ema_slow: 50
+    rsi_period: 14
+    atr_period: 14
+    rsi_overbought: 70.0
+    rsi_oversold: 30.0
+    atr_sl_multiplier: 1.5
+    atr_tp_multiplier: 3.0
+
+risk:
+  fixed_lot_size: 0.01
+  use_percent_risk_sizing: false
+  # Fractions of EQUITY (0.01 = 1%). Daily-loss accounting is done on
+  # equity, not balance — floating losses count.
+  max_risk_per_trade: 0.01
+  max_daily_loss: 0.03
+  max_open_positions: 3          # bot's OWN positions (magic-number filtered)
+  max_total_exposure_lots: 1.0   # own open volume + new request, in lots
+  max_consecutive_losses: 4
+  max_correlated_positions: 1    # stacked correlated bets allowed alongside a request
+  require_stop_loss: true
+  min_account_equity: 0.0        # 0 = disabled; gateway blocks below this
+  max_spread_points: 0.0         # 0 = disabled; in price points (tick-derived)
+
+autonomy:
+  # signals_only | assisted | autonomous
+  # signals_only: detect + report signals, never request trades
+  # assisted:     request trades, agent/human approves at the gateway input
+  # autonomous:   approved signals flow to the gateway without a human tap
+  # (the gateway's risk checks apply identically in every mode)
+  mode: assisted
+
+worker:
+  enabled: false
+  url: ""
+  poll_interval_seconds: 30
+
+exits:
+  enabled: true
+  max_hold_hours: 48.0
+  breakeven_trigger_atr: 1.0
+  trailing_activation_atr: 2.0
+  trailing_atr_multiplier: 1.5
+  check_interval_seconds: 60
+
+performance:
+  enabled: true
+  interval_hours: 6.0
+  lookback_days: 30
+
+kill_switch:
+  check_interval_seconds: 10
+
+events:
+  enabled: true
+  queue_max: 1000
+
+notifications:
+  enabled: false
+  # Delivery is via the Worker (FCM) when worker.enabled is true.
+
+logging:
+  level: INFO
+  format: json  # json | text
+
+charts:
+  symbols: []  # empty = trading symbols
+  timeframes:
+    - M15
+    - H1
+    - H4
+    - D1
+  candle_count: 150
+  update_interval_seconds: 120
+
+scan_interval_seconds: 60
+reconciliation_interval_seconds: 300
