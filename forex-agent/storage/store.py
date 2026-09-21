@@ -13,6 +13,9 @@ Contract (exact):
       .enqueue_event(dict)                / .dequeue_events(limit=100) -> list
       .audit(dict)                        / .query_audit(limit=100, since=None) -> list
       .journal_add(dict)                  / .journal_query(**filters) -> list
+      .event_journal_add(event_id, ...)   / .event_journal_after(event_id, limit)
+      .event_journal_latest(limit)        / .event_journal_ack(event_id)
+      .event_journal_last_id()            / .event_journal_get(event_id)
 
 Thread-safe: a single connection guarded by a re-entrant lock, opened with
 check_same_thread=False so daemon threads can share one Store.
@@ -245,3 +248,101 @@ class Store:
             entry["_ts"] = r["ts"]
             out.append(entry)
         return out
+
+    # -- event journal (agent push-event delivery log, Phase 4) ---------------
+    # Source of truth for the SSE stream: every published event lands here
+    # with a unique event_id, so reconnecting agents can resume/replay.
+    def event_journal_add(self, event_id: str, event: str, severity: str,
+                          ts: str, payload: dict) -> int:
+        """Record a published event. Duplicate event_id is ignored
+        (INSERT OR IGNORE) — the existing row id is returned. Returns the
+        journal row id."""
+        if not event_id:
+            raise ValueError("event_id is required")
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO event_journal(event_id, event, severity, ts, payload) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (event_id, event, severity, ts, json.dumps(payload)),
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT id FROM event_journal WHERE event_id = ?", (event_id,)
+            ).fetchone()
+        return row["id"]
+
+    def _event_journal_rowid(self, event_id: str):
+        row = self._conn.execute(
+            "SELECT id FROM event_journal WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        return row["id"] if row else None
+
+    @staticmethod
+    def _event_journal_entry(r) -> dict:
+        entry = json.loads(r["payload"])
+        entry["_journal_rowid"] = r["id"]
+        entry["_acked"] = bool(r["acked"])
+        return entry
+
+    def event_journal_after(self, event_id: str, limit: int = 1000) -> list:
+        """Events recorded strictly after `event_id`, oldest first.
+        Raises ValueError if `event_id` is unknown."""
+        if limit is not None and (not isinstance(limit, int) or limit < 1):
+            raise ValueError("limit must be a positive int")
+        with self._lock:
+            anchor = self._event_journal_rowid(event_id)
+            if anchor is None:
+                raise ValueError("unknown event_id: %r" % (event_id,))
+            rows = self._conn.execute(
+                "SELECT id, event_id, event, severity, ts, payload, acked "
+                "FROM event_journal WHERE id > ? ORDER BY id ASC LIMIT ?",
+                (anchor, limit),
+            ).fetchall()
+        return [self._event_journal_entry(r) for r in rows]
+
+    def event_journal_latest(self, limit: int = 50) -> list:
+        """Newest `limit` events, returned oldest-first (chronological)."""
+        if limit is not None and (not isinstance(limit, int) or limit < 1):
+            raise ValueError("limit must be a positive int")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, event_id, event, severity, ts, payload, acked "
+                "FROM event_journal ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [self._event_journal_entry(r) for r in reversed(rows)]
+
+    def event_journal_last_id(self):
+        """Most recently recorded event_id, or None when the journal is empty."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT event_id FROM event_journal ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        return row["event_id"] if row else None
+
+    def event_journal_ack(self, event_id: str) -> int:
+        """Mark `event_id` — and every event recorded at/before it — as
+        acknowledged (cumulative receipt, stream semantics). Returns the
+        number of rows marked, or 0 when `event_id` is unknown."""
+        ts = _utcnow()
+        with self._lock:
+            anchor = self._event_journal_rowid(event_id)
+            if anchor is None:
+                return 0
+            cur = self._conn.execute(
+                "UPDATE event_journal SET acked = 1, acked_ts = ? "
+                "WHERE id <= ? AND acked = 0",
+                (ts, anchor),
+            )
+            self._conn.commit()
+            return cur.rowcount
+
+    def event_journal_get(self, event_id: str):
+        """Single journal entry by event_id (dict) or None."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, event_id, event, severity, ts, payload, acked "
+                "FROM event_journal WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+        return self._event_journal_entry(row) if row else None
