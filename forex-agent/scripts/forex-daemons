@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
-# forex-daemons — idempotent supervisor for the four local daemons.
+# forex-daemons — idempotent supervisor for the local forex services.
+#
+# Managed processes:
+#   daemons   market_monitor signal_monitor position_monitor health_monitor
+#             (python3 -m daemon.<name>)
+#   services  local_api      loopback HTTP API + SSE event stream
+#                            (python3 scripts/local_api.py --port $FOREX_API_PORT)
+#             agent_bridge   persistent agent notification bridge:
+#                            SSE -> host-agent sink
+#                            (python3 -m agent.events.bridge)
 #
 # Usage:
-#   forex-daemons start [daemon...]    start all (or named) daemons
-#   forex-daemons stop [daemon...]     stop all (or named) daemons
-#   forex-daemons restart [daemon...]  stop, start, then run the restart
+#   forex-daemons start [name...]    start all (or named) daemons+services
+#   forex-daemons stop [name...]     stop all (or named) daemons+services
+#   forex-daemons restart [name...]  stop, start, then run the restart
 #                                      safety sequence (state restore +
 #                                      reconcile + health report)
-#   forex-daemons status [daemon...]   show running state
+#   forex-daemons status [name...]   show running state
 #   forex-daemons health [--json]      aggregate health: daemon liveness +
 #                                      kill-switch latch + broker_status +
 #                                      event-journal tail
@@ -16,21 +25,21 @@
 #   forex-daemons prune                bounded event-journal pruning
 #                                      (config: events.journal_retention_days
 #                                      / events.journal_max_events)
-#   forex-daemons logs [daemon...] [--lines N] [--follow]
-#                                      tail daemon log files
+#   forex-daemons logs [name...] [--lines N] [--follow]
+#                                      tail service log files
 #
-# Idempotent: starting a running daemon is a no-op (exit 0); stopping a
-# stopped daemon is a no-op (exit 0). Daemons are Python processes run as
-# `python3 -m daemon.<name>` from the forex-agent root; each holds a PID
-# file in $FOREX_AGENT_HOME/run/<name>.pid. Stale PID files (dead process)
-# are reclaimed automatically.
+# Idempotent: starting a running service is a no-op (exit 0); stopping a
+# stopped service is a no-op (exit 0). Services are Python processes; each
+# holds a PID file in $FOREX_AGENT_HOME/run/<name>.pid. Stale PID files
+# (dead process) are reclaimed automatically.
 #
-# No duplicate daemons: a flock(2) lock serializes every mutating command
-# (start/stop/restart/prune/safety), and each daemon process re-checks
+# No duplicates: a flock(2) lock serializes every mutating command
+# (start/stop/restart/prune/safety), and each service process re-checks
 # its PID file at startup (daemon.common.acquire_pidfile) — a second
-# launcher always loses and exits quietly.
+# launcher always loses and exits quietly, so two processes can never
+# bind the same API port.
 #
-# Daemon independence: daemons are launched detached via setsid+nohup in
+# Service independence: services are launched detached via setsid+nohup in
 # their own session, so they survive the exit of whatever started them
 # (agent process, shell, installer). An agent restart is NOT a forex
 # restart — use `forex-daemons restart` (or the systemd units) to restart
@@ -39,14 +48,18 @@
 # Environment:
 #   FOREX_AGENT_HOME     agent home (default ~/.forex-agent)
 #   FOREX_AGENT_STORAGE  sqlite path (default $FOREX_AGENT_HOME/storage/local.db)
+#   FOREX_API_PORT       local API/SSE port (default 8765)
 set -u
 
 DAEMONS="market_monitor signal_monitor position_monitor health_monitor"
+SERVICES="local_api agent_bridge"
+ALL="$DAEMONS $SERVICES"
 AGENT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HOME_DIR="${FOREX_AGENT_HOME:-$HOME/.forex-agent}"
 RUN_DIR="$HOME_DIR/run"
 LOG_DIR="$HOME_DIR/log"
 PYTHON="${PYTHON:-python3}"
+API_PORT="${FOREX_API_PORT:-8765}"
 LOCK_FILE="$RUN_DIR/.supervisor.lock"
 
 mkdir -p "$RUN_DIR" "$LOG_DIR"
@@ -71,23 +84,37 @@ pid_of() {  # pid_of <daemon> -> prints pid or nothing
 
 is_running() { [ -n "$(pid_of "$1")" ]; }
 
+# service_argv <name>: set SERVICE_ARGV to the process argv for a managed
+# daemon or service. Daemons are `python3 -m daemon.<name>`; the local API
+# and the notification bridge have their own entry points.
+service_argv() {
+    case "$1" in
+        local_api)    SERVICE_ARGV=("$PYTHON" "scripts/local_api.py"
+                                   "--port" "$API_PORT") ;;
+        agent_bridge) SERVICE_ARGV=("$PYTHON" "-m" "agent.events.bridge") ;;
+        *)            SERVICE_ARGV=("$PYTHON" "-m" "daemon.$1") ;;
+    esac
+}
+
 do_start_one() {
     local name="$1"
     if is_running "$name"; then
         echo "$name: already running (pid $(pid_of "$name"))"
         return 0
     fi
-    # Reclaim a stale pidfile so the daemon can start cleanly.
+    # Reclaim a stale pidfile so the service can start cleanly.
     rm -f "$RUN_DIR/$name.pid"
     cd "$AGENT_ROOT" || return 1
-    # setsid: the daemon gets its own session and survives the exit of
+    service_argv "$name"
+    # setsid: the service gets its own session and survives the exit of
     # this script / the agent process that invoked it. nohup: immune to
     # SIGHUP. </dev/null: never hold the caller's stdin. 9>&-: never
-    # inherit the supervisor lock (a daemon outliving the script must
+    # inherit the supervisor lock (a service outliving the script must
     # not keep the lock held forever).
     FOREX_AGENT_HOME="$HOME_DIR" FOREX_AGENT_STORAGE="${FOREX_AGENT_STORAGE:-$HOME_DIR/storage/local.db}" \
-        setsid nohup "$PYTHON" -m "daemon.$name" >> "$LOG_DIR/$name.log" 2>&1 < /dev/null 9>&- &
-    # The daemon writes its own pidfile at startup (acquire_pidfile);
+        FOREX_API_PORT="$API_PORT" \
+        setsid nohup "${SERVICE_ARGV[@]}" >> "$LOG_DIR/$name.log" 2>&1 < /dev/null 9>&- &
+    # The service writes its own pidfile at startup (acquire_pidfile);
     # poll for it instead of trusting the launcher pid.
     local i=0
     while [ "$i" -lt 20 ]; do
@@ -170,10 +197,10 @@ do_logs() {
             *) names="$names $1"; shift ;;
         esac
     done
-    [ -z "$names" ] && names="$DAEMONS"
+    [ -z "$names" ] && names="$ALL"
     local first=1
     for d in $names; do
-        case " $DAEMONS " in *" $d "*) ;; *) echo "unknown daemon: $d" >&2; return 2 ;; esac
+        case " $ALL " in *" $d "*) ;; *) echo "unknown service: $d" >&2; return 2 ;; esac
         local log="$LOG_DIR/$d.log"
         [ "$first" = 1 ] || echo
         first=0
@@ -188,14 +215,14 @@ do_logs() {
 
 resolve_targets() {
     if [ "$#" -eq 0 ]; then
-        echo "$DAEMONS"
+        echo "$ALL"
         return 0
     fi
     local out=""
     for d in "$@"; do
-        case " $DAEMONS " in
+        case " $ALL " in
             *" $d "*) out="$out $d" ;;
-            *) echo "unknown daemon: $d (choose from: $DAEMONS)" >&2; return 1 ;;
+            *) echo "unknown service: $d (choose from: $ALL)" >&2; return 1 ;;
         esac
     done
     echo "$out"

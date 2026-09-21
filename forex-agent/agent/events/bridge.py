@@ -236,12 +236,16 @@ class SubprocessSink(AgentNotificationSink):
                             % (self.argv[0], exc)) from exc
 
     def deliver(self, event: dict) -> None:
+        # Normalize to the documented envelope shape
+        # {event_id, event, severity, timestamp, payload}: the SSE data
+        # frames already carry exactly this, so this is normally a
+        # pass-through that just guards the keys.
         envelope = {
             "event_id": event.get("event_id"),
             "event": event.get("event"),
             "severity": event.get("severity", "INFO"),
-            "timestamp": event.get("ts"),
-            "payload": event,
+            "timestamp": event.get("timestamp") or event.get("ts"),
+            "payload": event.get("payload", event),
         }
         line = (json.dumps(envelope, default=str) + "\n").encode("utf-8")
         with self._lock:
