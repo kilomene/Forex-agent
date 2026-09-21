@@ -1,17 +1,24 @@
 """Event bus: proactive subsystem -> agent delivery.
 
 Every subsystem occurrence worth an agent's attention is validated against
-the structured schema below, persisted to the storage event queue, fanned
-out to in-process subscribers, and optionally POSTed to a configured
-webhook URL. The agent never has to poll "do we have a signal?" — events
-are emitted proactively and remain pollable via CLI/API.
+the structured schema below, persisted to local storage, fanned out to
+in-process subscribers, and optionally POSTed to a configured webhook URL.
+The agent never has to poll "do we have a signal?" — events are emitted
+proactively and remain pollable via CLI/API.
 
 Schema (TARGET ARCHITECTURE section 4):
     {"event": "<type>", "ts": "<ISO-8601>", ...type-specific fields}
 
-Cross-area contract: persistence goes through ``storage.store.Store``
-(see agent/API_DEPS.md). A store can be injected via ``configure()``
-(which is what tests do); otherwise the bus lazily imports storage.store.
+Persistence (dual-write, both via the real storage.Store surface —
+see agent/API_DEPS.md):
+  * ``enqueue_event`` — the durable FIFO queue. The health_monitor daemon
+    drains it (``dequeue_events``) and forwards to the Worker cloud layer.
+    Destructive reads, so the agent's pollable log does NOT read this.
+  * ``journal_add(kind="event", ...)`` — the pollable event LOG.
+    ``poll()`` reads it back non-destructively via
+    ``journal_query(kind="event", since=..., limit=...)``.
+If storage later gains a dedicated event-log table / peek_events, the bus
+can migrate poll() onto it; the journal fallback is documented, not hidden.
 """
 
 from __future__ import annotations
@@ -128,6 +135,9 @@ EVENT_SCHEMAS: Dict[str, Dict[str, List[str]]] = {
 # Every event also carries these implicitly.
 _META_FIELDS = ("event", "ts")
 
+# Journal kind under which the pollable event log is kept.
+_EVENT_JOURNAL_KIND = "event"
+
 
 def _parse_ts(value: str) -> datetime:
     """Parse an ISO-8601 timestamp or raise ValueError."""
@@ -184,8 +194,8 @@ def validate_event(event: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Store plumbing (storage.store is owned by the storage builder; see
-# agent/API_DEPS.md for the expected interface).
+# Store plumbing (storage.Store, owned by the storage builder;
+# see agent/API_DEPS.md for the exact expected surface).
 # ---------------------------------------------------------------------------
 
 _store_override = None
@@ -195,8 +205,8 @@ _store_lock = threading.Lock()
 def configure(store=None, webhook_url: Optional[str] = None) -> None:
     """Inject dependencies (used by tests and embedding hosts).
 
-    store: object with ``append_event(event: dict)`` and
-           ``get_events(since=None, limit=100) -> list[dict]``.
+    store: storage.Store-compatible object (enqueue_event / journal_add /
+           journal_query — see agent/API_DEPS.md).
     webhook_url: optional HTTPS URL receiving every published event.
     """
     global _store_override
@@ -212,15 +222,15 @@ _cached_store = None
 
 
 def _default_store():
-    """Lazily import storage.store.Store (owned by the storage builder)."""
+    """Lazily build storage.Store (owned by the storage builder)."""
     global _cached_store
     if _cached_store is not None:
         return _cached_store
     try:
-        from storage.store import Store  # noqa: PLC0415 (lazy, documented dep)
+        from storage import Store  # noqa: PLC0415 (lazy, documented dep)
     except ImportError as exc:
         raise RuntimeError(
-            "storage.store is unavailable; the event bus requires the storage "
+            "storage is unavailable; the event bus requires the storage "
             "package (see agent/API_DEPS.md). Original error: %s" % exc
         ) from exc
     _cached_store = Store()
@@ -231,6 +241,46 @@ def _get_store():
     if _store_override is not None:
         return _store_override
     return _default_store()
+
+
+def _store_append_event(store, event: dict) -> None:
+    """Durable queue write (+ legacy append_event fallback for old fakes)."""
+    if hasattr(store, "enqueue_event"):
+        store.enqueue_event(event)
+    elif hasattr(store, "append_event"):
+        store.append_event(event)
+    else:
+        raise RuntimeError("store has no enqueue_event/append_event")
+
+
+def _store_log_event(store, event: dict) -> None:
+    """Pollable-log write via the journal (kind='event')."""
+    if hasattr(store, "journal_add"):
+        store.journal_add({
+            "kind": _EVENT_JOURNAL_KIND,
+            "symbol": event.get("symbol"),
+            "direction": event.get("direction"),
+            "payload": event,
+        })
+    elif hasattr(store, "append_event"):
+        pass  # legacy fakes: append_event already persisted it
+    else:
+        raise RuntimeError("store has no journal_add")
+
+
+def _store_read_events(store, since: Optional[str], limit: int) -> List[dict]:
+    """Non-destructive pollable-log read, chronological order."""
+    if hasattr(store, "journal_query"):
+        filters = {"kind": _EVENT_JOURNAL_KIND}
+        if since:
+            filters["since"] = since
+        entries = store.journal_query(limit=limit, **filters)
+        events = [e["payload"] for e in entries if isinstance(e.get("payload"), dict)]
+        events.reverse()  # journal_query is newest-first; poll is chronological
+        return events
+    if hasattr(store, "get_events"):
+        return store.get_events(since=since, limit=limit)
+    raise RuntimeError("store has no journal_query/get_events")
 
 
 # ---------------------------------------------------------------------------
@@ -287,8 +337,8 @@ def _deliver_webhook(event: dict) -> None:
             if resp.status >= 300:
                 logger.warning("webhook delivery returned HTTP %s", resp.status)
     except Exception as exc:
-        # Webhook is best-effort: the durable record is the local event
-        # log. Never let a webhook failure break publishing.
+        # Webhook is best-effort: the durable record is local storage.
+        # Never let a webhook failure break publishing.
         logger.warning("webhook delivery failed: %s", exc)
 
 
@@ -297,29 +347,32 @@ def _deliver_webhook(event: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def publish(event: dict) -> dict:
-    """Validate, persist, fan out, and webhook-deliver one event.
+    """Validate, persist (queue + pollable log), fan out, webhook-deliver.
 
     Returns the normalized stored event. Raises ValueError on schema
     violations and RuntimeError if the storage backend is unavailable.
     """
     normalized = validate_event(event)
-    _get_store().append_event(normalized)
+    store = _get_store()
+    _store_append_event(store, normalized)
+    _store_log_event(store, normalized)
     _dispatch(normalized)
     _deliver_webhook(normalized)
     return normalized
 
 
 def poll(since: Optional[str] = None, limit: int = 100) -> List[dict]:
-    """Read persisted events, newest-first cap ``limit``.
+    """Read the pollable event log, chronological order, capped at ``limit``.
 
-    ``since`` is an ISO-8601 timestamp; only events at/after it are
-    returned. Raises ValueError on a malformed ``since``.
+    ``since`` is an ISO-8601 timestamp; only events logged at/after it are
+    returned. Non-destructive: polling never consumes the queue.
+    Raises ValueError on a malformed ``since``.
     """
     if since is not None:
         _parse_ts(since)  # validate early
     if limit is not None and (not isinstance(limit, int) or limit < 1):
         raise ValueError("limit must be a positive int")
-    return _get_store().get_events(since=since, limit=limit or 100)
+    return _store_read_events(_get_store(), since, limit or 100)
 
 
 def reset_for_tests() -> None:
