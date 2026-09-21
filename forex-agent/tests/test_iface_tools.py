@@ -35,7 +35,7 @@ from agent.events import bus  # noqa: E402
 from agent.tools import backend, registry, trading  # noqa: E402
 from agent.tools.registry import get_capability as _get_capability  # noqa: E402
 try:
-    from tests.fakes import FakeBroker, FakeGateway  # noqa: E402
+    from tests.test_iface_fakes import FakeBroker, FakeGateway  # noqa: E402
 except ImportError:  # direct script run: tests/ is sys.path[0]
     from fakes import FakeBroker, FakeGateway  # noqa: E402
 

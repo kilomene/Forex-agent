@@ -57,6 +57,10 @@ EVENT_SCHEMAS: Dict[str, Dict[str, List[str]]] = {
         "required": ["symbol"],
         "optional": ["timeframe", "last_tick_age_s", "note"],
     },
+    "market.candle_closed": {
+        "required": ["symbol", "timeframe", "candle_time"],
+        "optional": ["note"],
+    },
     # Trading -------------------------------------------------------------
     "trade.requested": {
         "required": ["symbol", "side", "volume", "idempotency_key"],
@@ -121,6 +125,14 @@ EVENT_SCHEMAS: Dict[str, Dict[str, List[str]]] = {
     "daemon.stopped": {
         "required": ["daemon"],
         "optional": ["reason", "pid"],
+    },
+    "health.check": {
+        "required": ["ok"],
+        "optional": ["checks", "daemon", "note"],
+    },
+    "performance.snapshot": {
+        "required": ["period_days"],
+        "optional": ["snapshot", "daemon"],
     },
     "health.degraded": {
         "required": ["component"],

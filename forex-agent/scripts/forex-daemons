@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# forex-daemons — idempotent supervisor for the four local daemons.
+#
+# Usage:
+#   forex-daemons start [daemon...]    start all (or named) daemons
+#   forex-daemons stop [daemon...]     stop all (or named) daemons
+#   forex-daemons restart [daemon...]  stop then start
+#   forex-daemons status [daemon...]   show running state
+#
+# Idempotent: starting a running daemon is a no-op (exit 0); stopping a
+# stopped daemon is a no-op (exit 0). Daemons are Python processes run as
+# `python3 -m daemon.<name>` from the forex-agent root; each holds a PID
+# file in $FOREX_AGENT_HOME/run/<name>.pid. Stale PID files (dead process)
+# are reclaimed automatically.
+#
+# Environment:
+#   FOREX_AGENT_HOME     agent home (default ~/.forex-agent)
+#   FOREX_AGENT_STORAGE  sqlite path (default $FOREX_AGENT_HOME/storage/local.db)
+set -u
+
+DAEMONS="market_monitor signal_monitor position_monitor health_monitor"
+AGENT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+HOME_DIR="${FOREX_AGENT_HOME:-$HOME/.forex-agent}"
+RUN_DIR="$HOME_DIR/run"
+PYTHON="${PYTHON:-python3}"
+
+mkdir -p "$RUN_DIR"
+
+pid_of() {  # pid_of <daemon> -> prints pid or nothing
+    local pidfile="$RUN_DIR/$1.pid"
+    [ -f "$pidfile" ] || return 0
+    local pid
+    pid="$(tr -dc '0-9' < "$pidfile" 2>/dev/null)"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && echo "$pid"
+}
+
+is_running() { [ -n "$(pid_of "$1")" ]; }
+
+do_start_one() {
+    local name="$1"
+    if is_running "$name"; then
+        echo "$name: already running (pid $(pid_of "$name"))"
+        return 0
+    fi
+    # Reclaim a stale pidfile so the daemon can start cleanly.
+    rm -f "$RUN_DIR/$name.pid"
+    cd "$AGENT_ROOT" || return 1
+    FOREX_AGENT_HOME="$HOME_DIR" FOREX_AGENT_STORAGE="${FOREX_AGENT_STORAGE:-$HOME_DIR/storage/local.db}" \
+        nohup "$PYTHON" -m "daemon.$name" >> "$HOME_DIR/log/$name.log" 2>&1 &
+    local launcher=$!
+    # Give it a moment to claim its pidfile, then verify.
+    sleep 1
+    if is_running "$name"; then
+        echo "$name: started (pid $(pid_of "$name"))"
+        return 0
+    fi
+    # Fall back to the launcher pid if the daemon died instantly.
+    if kill -0 "$launcher" 2>/dev/null; then
+        echo "$name: starting (launcher pid $launcher)"
+        return 0
+    fi
+    echo "$name: FAILED to start (see $HOME_DIR/log/$name.log)" >&2
+    return 1
+}
+
+do_stop_one() {
+    local name="$1"
+    local pid
+    pid="$(pid_of "$name")"
+    if [ -z "$pid" ]; then
+        rm -f "$RUN_DIR/$name.pid"
+        echo "$name: not running"
+        return 0
+    fi
+    kill "$pid" 2>/dev/null
+    # Wait up to 10s for a clean exit (SIGTERM -> graceful shutdown).
+    local i=0
+    while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 10 ]; do
+        sleep 1
+        i=$((i + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null
+        echo "$name: force-killed (pid $pid)"
+    else
+        echo "$name: stopped"
+    fi
+    rm -f "$RUN_DIR/$name.pid"
+    return 0
+}
+
+do_status_one() {
+    local name="$1"
+    local pid
+    pid="$(pid_of "$name")"
+    if [ -n "$pid" ]; then
+        echo "$name: running (pid $pid)"
+    else
+        echo "$name: stopped"
+    fi
+}
+
+resolve_targets() {
+    if [ "$#" -eq 0 ]; then
+        echo "$DAEMONS"
+        return 0
+    fi
+    local out=""
+    for d in "$@"; do
+        case " $DAEMONS " in
+            *" $d "*) out="$out $d" ;;
+            *) echo "unknown daemon: $d (choose from: $DAEMONS)" >&2; return 1 ;;
+        esac
+    done
+    echo "$out"
+}
+
+mkdir -p "$HOME_DIR/log"
+
+cmd="${1:-status}"
+shift || true
+targets="$(resolve_targets "$@")" || exit 2
+
+rc=0
+case "$cmd" in
+    start)   for d in $targets; do do_start_one "$d" || rc=1; done ;;
+    stop)    for d in $targets; do do_stop_one "$d" || rc=1; done ;;
+    restart) for d in $targets; do do_stop_one "$d"; done
+             for d in $targets; do do_start_one "$d" || rc=1; done ;;
+    status)  for d in $targets; do do_status_one "$d"; done ;;
+    *) echo "usage: $0 {start|stop|restart|status} [daemon...]" >&2; exit 2 ;;
+esac
+exit "$rc"

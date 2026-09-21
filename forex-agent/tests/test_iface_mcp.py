@@ -26,7 +26,7 @@ from agent.mcp import server  # noqa: E402
 from agent.tools import backend  # noqa: E402
 
 try:
-    from tests.fakes import FakeBroker, FakeGateway  # noqa: E402
+    from tests.test_iface_fakes import FakeBroker, FakeGateway  # noqa: E402
 except ImportError:
     from fakes import FakeBroker, FakeGateway  # noqa: E402
 

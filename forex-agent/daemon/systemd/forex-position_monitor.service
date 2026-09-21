@@ -1,0 +1,28 @@
+[Unit]
+Description=Forex agent position_monitor
+Documentation=file:///opt/forex-agent/docs/OPERATIONS.md
+After=network.target
+PartOf=forex-agent.target
+
+[Service]
+Type=simple
+User=forex
+# The installer creates the unprivileged `forex` user; override with
+# `systemctl edit forex-<name>.service` to run as someone else.
+# Install location of the forex-agent tree (override with
+# systemctl edit if installed elsewhere).
+WorkingDirectory=/opt/forex-agent
+Environment=FOREX_AGENT_HOME=/var/lib/forex-agent
+Environment=FOREX_AGENT_STORAGE=/var/lib/forex-agent/storage/local.db
+ExecStart=/usr/bin/python3 -m daemon.position_monitor
+Restart=on-failure
+RestartSec=10
+# Graceful shutdown: SIGTERM -> daemon finishes its cycle and exits.
+TimeoutStopSec=30
+# Logs go to the journal; per-daemon files also land in
+# $FOREX_AGENT_HOME/log/ via the supervisor script.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=forex-agent.target
