@@ -9,7 +9,7 @@ proactively and remain pollable via CLI/API.
 Schema (TARGET ARCHITECTURE section 4):
     {"event": "<type>", "ts": "<ISO-8601>", ...type-specific fields}
 
-Persistence (dual-write, both via the real storage.Store surface —
+Persistence (writes via the real storage.Store surface —
 see agent/API_DEPS.md):
   * ``enqueue_event`` — the durable FIFO queue. The health_monitor daemon
     drains it (``dequeue_events``) and forwards to the Worker cloud layer.
@@ -17,8 +17,23 @@ see agent/API_DEPS.md):
   * ``journal_add(kind="event", ...)`` — the pollable event LOG.
     ``poll()`` reads it back non-destructively via
     ``journal_query(kind="event", since=..., limit=...)``.
+  * ``event_journal_add`` — the push-event DELIVERY journal (Phase 4).
+    Every published event is recorded here with its unique ``event_id``
+    and severity. The SSE stream (scripts/local_api.py ``GET /events``)
+    replays from this journal, so a reconnecting agent can resume with
+    ``resume_from=<event_id>`` and never miss — or double-process — an
+    event. Duplicates are impossible: ``event_id`` is UNIQUE, a retried
+    publish of the same id is ignored, and the agent can always dedup
+    on ``event_id``.
 If storage later gains a dedicated event-log table / peek_events, the bus
 can migrate poll() onto it; the journal fallback is documented, not hidden.
+
+Severity (Phase 4): every event carries ``severity`` in
+INFO / NOTICE / WARNING / CRITICAL. ``publish`` accepts an explicit
+severity; otherwise it is mapped from the event type
+(``DEFAULT_SEVERITY``), with ``risk.blocked`` escalated to CRITICAL when
+its reason is the daily-loss limit. Every event also carries a unique
+``event_id`` (``evt_`` + uuid4 hex), auto-assigned when absent.
 """
 
 from __future__ import annotations
@@ -28,6 +43,7 @@ import json
 import logging
 import threading
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
@@ -145,7 +161,73 @@ EVENT_SCHEMAS: Dict[str, Dict[str, List[str]]] = {
 }
 
 # Every event also carries these implicitly.
-_META_FIELDS = ("event", "ts")
+_META_FIELDS = ("event", "ts", "event_id", "severity")
+
+# ---------------------------------------------------------------------------
+# Severity (Phase 4): INFO / NOTICE / WARNING / CRITICAL.
+# ---------------------------------------------------------------------------
+
+SEVERITIES = ("INFO", "NOTICE", "WARNING", "CRITICAL")
+
+DEFAULT_SEVERITY: Dict[str, str] = {
+    # Market intelligence -------------------------------------------------
+    "signal.detected": "NOTICE",
+    "signal.approved": "NOTICE",
+    "signal.rejected": "NOTICE",
+    "market.data_stale": "WARNING",
+    "market.candle_closed": "INFO",
+    # Trading -------------------------------------------------------------
+    "trade.requested": "INFO",
+    "trade.executed": "NOTICE",
+    "trade.rejected": "WARNING",
+    "position.closed": "NOTICE",
+    "position.modified": "NOTICE",
+    "position.external_close": "WARNING",
+    # Risk / safety -------------------------------------------------------
+    # risk.blocked is WARNING, escalated to CRITICAL when the reason is
+    # the daily-loss limit (see _resolve_severity).
+    "risk.blocked": "WARNING",
+    "kill_switch.activated": "CRITICAL",
+    "kill_switch.cleared": "NOTICE",
+    # Broker --------------------------------------------------------------
+    "broker.connected": "INFO",
+    "broker.disconnected": "CRITICAL",
+    # Worker (cloud sync layer) -------------------------------------------
+    "worker.unavailable": "WARNING",
+    "worker.reconnected": "NOTICE",
+    # Daemons / health ----------------------------------------------------
+    "daemon.started": "INFO",
+    "daemon.stopped": "WARNING",
+    "health.check": "INFO",
+    "health.degraded": "WARNING",
+    "health.recovered": "NOTICE",
+    "performance.snapshot": "INFO",
+}
+
+
+def new_event_id() -> str:
+    """Unique event id: ``evt_`` + uuid4 hex."""
+    return "evt_" + uuid.uuid4().hex
+
+
+def _resolve_severity(event_name: Optional[str], reason=None,
+                      explicit: Optional[str] = None) -> str:
+    """Resolve an event's severity.
+
+    Precedence: explicit severity argument > ``severity`` already on the
+    event dict > type mapping > INFO. ``risk.blocked`` whose reason names
+    the daily-loss limit is escalated to CRITICAL.
+    """
+    if explicit is not None:
+        if explicit not in SEVERITIES:
+            raise ValueError(
+                "invalid severity %r; must be one of %s"
+                % (explicit, ", ".join(SEVERITIES)))
+        return explicit
+    if (event_name == "risk.blocked" and reason is not None
+            and "DAILY_LOSS" in str(reason).upper()):
+        return "CRITICAL"
+    return DEFAULT_SEVERITY.get(event_name, "INFO")
 
 # Journal kind under which the pollable event log is kept.
 _EVENT_JOURNAL_KIND = "event"
@@ -168,7 +250,9 @@ def utcnow_iso() -> str:
 def validate_event(event: dict) -> dict:
     """Validate an event dict against the structured schema.
 
-    Returns a normalized *copy* (ts stamped if absent). Raises ValueError
+    Returns a normalized *copy* (ts stamped if absent). ``event_id`` and
+    ``severity`` are accepted as implicit meta fields on every event type;
+    a present-but-invalid ``severity`` is rejected. Raises ValueError
     listing every problem found — malformed events are rejected, never
     silently repaired (except for the missing-ts convenience stamp).
     """
@@ -195,6 +279,15 @@ def validate_event(event: dict) -> dict:
             _parse_ts(event["ts"])
         except ValueError:
             problems.append("ts is not valid ISO-8601: %r" % (event["ts"],))
+
+    if "severity" in event and event["severity"] is not None:
+        if event["severity"] not in SEVERITIES:
+            problems.append("severity must be one of %s, got %r"
+                            % (", ".join(SEVERITIES), event["severity"]))
+
+    if "event_id" in event and event["event_id"] is not None:
+        if not isinstance(event["event_id"], str) or not event["event_id"]:
+            problems.append("event_id must be a non-empty string")
 
     if problems:
         raise ValueError("invalid event %r: %s" % (name, "; ".join(problems)))
@@ -280,6 +373,36 @@ def _store_log_event(store, event: dict) -> None:
         raise RuntimeError("store has no journal_add")
 
 
+def _store_journal_event(store, event: dict) -> None:
+    """Push-delivery journal write (Phase 4).
+
+    Every published event lands in the persistent event journal with its
+    unique event_id — this is what the SSE stream replays from. Stores
+    without the event_journal_* surface (legacy fakes) are skipped: the
+    queue + pollable log above remain the backward-compatible record.
+    """
+    if not hasattr(store, "event_journal_add"):
+        logger.debug("store has no event_journal_add; skipping delivery journal")
+        return
+    store.event_journal_add(
+        event_id=event["event_id"],
+        event=event["event"],
+        severity=event.get("severity", "INFO"),
+        ts=event["ts"],
+        payload=event,
+    )
+
+
+def _journal_store():
+    """The configured store, or RuntimeError when it has no event journal."""
+    store = _get_store()
+    if not hasattr(store, "event_journal_add"):
+        raise RuntimeError(
+            "event journal unavailable: configured store has no "
+            "event_journal_* methods (use storage.Store)")
+    return store
+
+
 def _store_read_events(store, since: Optional[str], limit: int) -> List[dict]:
     """Non-destructive pollable-log read, chronological order."""
     if hasattr(store, "journal_query"):
@@ -358,16 +481,34 @@ def _deliver_webhook(event: dict) -> None:
 # Public API
 # ---------------------------------------------------------------------------
 
-def publish(event: dict) -> dict:
-    """Validate, persist (queue + pollable log), fan out, webhook-deliver.
+def publish(event: dict, severity: Optional[str] = None) -> dict:
+    """Validate, persist (queue + pollable log + delivery journal), fan out,
+    webhook-deliver.
 
-    Returns the normalized stored event. Raises ValueError on schema
-    violations and RuntimeError if the storage backend is unavailable.
+    ``severity`` optionally overrides the mapped default (one of
+    INFO/NOTICE/WARNING/CRITICAL). A unique ``event_id`` (``evt_`` + uuid4)
+    is auto-assigned when the event doesn't carry one. Returns the
+    normalized stored event. Raises ValueError on schema violations and
+    RuntimeError if the storage backend is unavailable.
+
+    Backward compatible: ``publish(event)`` behaves exactly as before,
+    except the returned event now also carries ``event_id`` and
+    ``severity``.
     """
-    normalized = validate_event(event)
+    working = dict(event) if isinstance(event, dict) else event
+    if isinstance(working, dict):
+        if not working.get("event_id"):
+            working["event_id"] = new_event_id()
+        working["severity"] = _resolve_severity(
+            working.get("event"),
+            reason=working.get("reason"),
+            explicit=severity if severity is not None else working.get("severity"),
+        )
+    normalized = validate_event(working)
     store = _get_store()
     _store_append_event(store, normalized)
     _store_log_event(store, normalized)
+    _store_journal_event(store, normalized)
     _dispatch(normalized)
     _deliver_webhook(normalized)
     return normalized
@@ -385,6 +526,51 @@ def poll(since: Optional[str] = None, limit: int = 100) -> List[dict]:
     if limit is not None and (not isinstance(limit, int) or limit < 1):
         raise ValueError("limit must be a positive int")
     return _store_read_events(_get_store(), since, limit or 100)
+
+
+# ---------------------------------------------------------------------------
+# Delivery journal reads (Phase 4): replay / resume / ack for push consumers.
+# ---------------------------------------------------------------------------
+
+def replay_after(event_id: str, limit: int = 1000) -> List[dict]:
+    """Events journaled strictly after ``event_id``, chronological order.
+
+    Used by reconnecting SSE subscribers (``resume_from``) and the
+    ``--since-id`` poll fallback. Raises ValueError when ``event_id`` is
+    unknown — a client holding an id the journal never saw is almost
+    certainly talking to a fresh/rotated journal and must say so loudly,
+    not silently miss events.
+    """
+    if not isinstance(event_id, str) or not event_id:
+        raise ValueError("event_id must be a non-empty string")
+    if not isinstance(limit, int) or limit < 1:
+        raise ValueError("limit must be a positive int")
+    return _journal_store().event_journal_after(event_id, limit=limit)
+
+
+def latest_events(limit: int = 50) -> List[dict]:
+    """Newest ``limit`` journaled events, chronological order."""
+    if not isinstance(limit, int) or limit < 1:
+        raise ValueError("limit must be a positive int")
+    return _journal_store().event_journal_latest(limit=limit)
+
+
+def last_event_id() -> Optional[str]:
+    """Most recently journaled event_id, or None when the journal is empty."""
+    return _journal_store().event_journal_last_id()
+
+
+def acknowledge(event_id: str) -> bool:
+    """Acknowledge receipt of ``event_id``.
+
+    Cumulative: the named event and every event journaled at/before it
+    are marked delivered. Returns True when the id was known, False when
+    unknown. Ack is a delivery marker only — replays still return acked
+    events, and the agent dedups on ``event_id``.
+    """
+    if not isinstance(event_id, str) or not event_id:
+        raise ValueError("event_id must be a non-empty string")
+    return _journal_store().event_journal_ack(event_id) > 0
 
 
 def reset_for_tests() -> None:
