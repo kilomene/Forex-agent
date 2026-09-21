@@ -2,7 +2,7 @@
 # install.sh — Linux-first, idempotent installer for the forex-agent subsystem.
 #
 #   installer/install.sh [--prefix DIR] [--system] [--non-interactive]
-#                        [--skip-daemons] [--source DIR]
+#                        [--skip-daemons] [--source DIR] [--agent|--json]
 #
 # Agent-friendly: every knob is a flag or an env var; with --non-interactive
 # it never prompts. Safe to re-run: every step detects existing state and
@@ -12,6 +12,23 @@
 #   {"state": "ready"}              everything installed and verified
 #   {"state": "needs_credentials"}  installed; broker credentials missing
 #   {"state": "error", "error": {"code","step","message"}}
+#
+# With --agent (alias --json) the installer additionally emits a
+# machine-readable install result on stdout and always writes
+# $FOREX_AGENT_HOME/install-result.json. The result's "status" is derived
+# from REAL probes (broker_status(), config mode, kill switch, daemon
+# supervisor) — never invented:
+#   installed            verified install, disconnected analysis mode
+#   configured           verified, broker credentials present, daemons not started
+#   operational          daemons running (subsystem operating; see broker field)
+#   broker_disconnected  broker expected (provider != disconnected) but probe failed
+#   broker_connected     broker probe: logged in, trading not available
+#   trading_disabled     broker up but dry-run default or kill switch engaged
+#   trading_ready        broker up + trading_available + mode=live + kill switch clear
+#   needs_credentials    provider != disconnected and MT5_* keys missing/invalid
+#   error                a step failed (error.code/step/message)
+# Missing credentials are reported as {"status":"needs_credentials",
+# "required":[...]}; empty or whitespace-only values count as missing.
 #
 # Secrets (MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, WORKER_API_KEY) come from
 # the environment or an interactive prompt, and are written to
@@ -24,6 +41,7 @@ SYSTEM=0
 NON_INTERACTIVE=0
 SKIP_DAEMONS=0
 SOURCE=""
+AGENT_OUT=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -32,7 +50,8 @@ while [ $# -gt 0 ]; do
         --non-interactive) NON_INTERACTIVE=1; shift ;;
         --skip-daemons)    SKIP_DAEMONS=1; shift ;;
         --source)          SOURCE="$2"; shift 2 ;;
-        -h|--help)         sed -n '2,14p' "$0"; exit 0 ;;
+        --agent|--json)    AGENT_OUT=1; shift ;;
+        -h|--help)         sed -n '2,30p' "$0"; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -48,15 +67,6 @@ ENV_FILE="$PREFIX/agent.env"
 SECRET_KEYS="MT5_LOGIN MT5_PASSWORD MT5_SERVER WORKER_API_KEY"
 
 log()  { echo "[install] $*"; }
-fail() { # fail <code> <step> <message>
-    local code="$1" step="$2" msg="$3"
-    log "ERROR [$code] at $step: $msg"
-    mkdir -p "$(dirname "$STATE_FILE")"
-    printf '{"state":"error","error":{"code":%s,"step":%s,"message":%s},"updated_at":%s}\n' \
-        "$(jsonq "$code")" "$(jsonq "$step")" "$(jsonq "$msg")" "$(jsonq "$(date -u +%FT%TZ)")" \
-        > "$STATE_FILE"
-    exit 1
-}
 jsonq() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
 write_state() { # write_state <state> [extra_json]
     local state="$1" extra="${2:-}"
@@ -67,6 +77,159 @@ write_state() { # write_state <state> [extra_json]
         printf '{"state":%s,"updated_at":%s}\n' \
             "$(jsonq "$state")" "$(jsonq "$(date -u +%FT%TZ)")" > "$STATE_FILE"
     fi
+}
+
+# -- agent result ------------------------------------------------------------
+# agent_probe: run the REAL probes (config mode, kill switch, broker_status)
+# in the source tree. Prints one JSON line on stdout; never fails the caller.
+agent_probe() {
+    ( cd "$SOURCE" 2>/dev/null || exit 1
+      FOREX_AGENT_HOME="$PREFIX" FOREX_AGENT_STORAGE="$PREFIX/storage/local.db" \
+      timeout 90 python3 - 2>/dev/null <<'PYEOF' | grep '^{' | tail -n 1
+import json
+out = {"probe_ok": False}
+try:
+    from agent.tools import backend
+    cfg = backend.app_config()
+    try:
+        kill_engaged = bool(backend.store().get_kill_switch().get("engaged"))
+    except Exception:
+        kill_engaged = None
+    try:
+        broker = backend.broker_adapter().broker_status().get("broker", {})
+        broker_probe_ok = True
+    except Exception as exc:  # broker_status() itself never raises; the lookup might
+        broker = {}
+        broker_probe_ok = False
+        out["error"] = "broker probe failed: %s" % str(exc)[:200]
+    out.update({"probe_ok": True, "mode": cfg.mode,
+                "kill_engaged": kill_engaged,
+                "broker": broker, "broker_probe_ok": broker_probe_ok})
+except Exception as exc:
+    out = {"probe_ok": False, "error": str(exc)[:200]}
+print(json.dumps(out))
+PYEOF
+    )
+    return 0
+}
+
+# emit_agent_result [status] [error_json]: derive the machine-readable
+# install result from real probes, write $PREFIX/install-result.json, and
+# print it on stdout when --agent/--json was passed. With no status the
+# status is derived; pass "error" explicitly from fail().
+emit_agent_result() {
+    local status="${1:-}" err="${2:-null}"
+    local probe daemons_out
+    probe="$(agent_probe)" || probe=""
+    [ -n "$probe" ] || probe='{"probe_ok":false}'
+    daemons_out="$(FOREX_AGENT_HOME="$PREFIX" timeout 30 ./scripts/forex-daemons status 2>/dev/null)" \
+        || daemons_out=""
+    AGENT_STATUS="$status" AGENT_ERR="$err" AGENT_PROBE="$probe" \
+    AGENT_DAEMONS="$daemons_out" AGENT_PREFIX="$PREFIX" AGENT_SOURCE="$SOURCE" \
+    AGENT_OUT="$AGENT_OUT" \
+    python3 - <<'PYEOF'
+import json, os
+
+status = os.environ.get("AGENT_STATUS", "")
+err = json.loads(os.environ.get("AGENT_ERR") or "null")
+probe = json.loads(os.environ.get("AGENT_PROBE") or '{"probe_ok": false}')
+dstat = os.environ.get("AGENT_DAEMONS", "")
+prefix = os.environ["AGENT_PREFIX"]
+source = os.environ["AGENT_SOURCE"]
+show = os.environ.get("AGENT_OUT") == "1"
+
+SECRET_KEYS = ("MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER")
+provider = (os.environ.get("BROKER_PROVIDER") or "disconnected").strip().lower()
+# Empty or whitespace-only counts as missing/invalid.
+missing = [k for k in SECRET_KEYS if not (os.environ.get(k) or "").strip()]
+
+DAEMON_NAMES = ("market_monitor", "signal_monitor",
+                "position_monitor", "health_monitor")
+daemons_running = bool(dstat) and all(
+    ("%s: running" % n) in dstat for n in DAEMON_NAMES)
+
+probe_ok = bool(probe.get("probe_ok")) and bool(probe.get("broker_probe_ok"))
+broker = probe.get("broker") if isinstance(probe.get("broker"), dict) else {}
+
+if not status:
+    if err is not None:
+        status = "error"
+    elif provider != "disconnected" and missing:
+        status = "needs_credentials"
+    elif probe_ok:
+        connected = bool(broker.get("connected"))
+        trading_avail = bool(broker.get("trading_available"))
+        mode = probe.get("mode")
+        kill = probe.get("kill_engaged")
+        if connected and trading_avail and mode == "live" and kill is False:
+            status = "trading_ready"
+        elif connected and trading_avail:
+            status = "trading_disabled"   # dry-run default or kill switch engaged
+        elif connected:
+            status = "broker_connected"
+        elif daemons_running:
+            status = "broker_disconnected"
+        elif provider != "disconnected":
+            status = "configured"        # creds present, daemons not started
+        else:
+            status = "installed"          # disconnected analysis mode, verified
+    else:
+        status = "broker_disconnected" if daemons_running else (
+            "configured" if (provider != "disconnected" and not missing)
+            else "installed")
+
+result = {
+    "schema": "forex-agent.install-result/1",
+    "status": status,
+    "prefix": prefix,
+    "mode": probe.get("mode") if probe.get("probe_ok") else None,
+    "kill_switch_engaged": (probe.get("kill_engaged")
+                            if probe.get("probe_ok") else None),
+    "signals": "unavailable" if status == "error" else "available",
+    "events": "running" if daemons_running else "stopped",
+    "mcp": "unavailable" if status == "error" else "available",
+    "daemons": daemons_running,
+    "manifest": os.path.join(source, "agent", "capabilities.json"),
+}
+if probe_ok:
+    result["broker"] = "connected" if broker.get("connected") else "disconnected"
+    detail = broker.get("detail")
+    result["broker_detail"] = (detail.get("reason")
+                               if isinstance(detail, dict) else None)
+    result["broker_provider"] = broker.get("provider")
+    result["trading"] = "ready" if status == "trading_ready" else "disabled"
+else:
+    result["broker"] = "unavailable"
+    result["broker_detail"] = probe.get("error") or "broker probe failed"
+    result["broker_provider"] = provider or None
+    result["trading"] = "unavailable"
+if status == "needs_credentials":
+    result["required"] = missing
+if status == "error" and err is not None:
+    result["error"] = err
+
+os.makedirs(prefix, exist_ok=True)
+with open(os.path.join(prefix, "install-result.json"), "w") as fh:
+    json.dump(result, fh, indent=2)
+    fh.write("\n")
+if show:
+    print(json.dumps(result))
+PYEOF
+}
+
+fail() { # fail <code> <step> <message>
+    local code="$1" step="$2" msg="$3"
+    log "ERROR [$code] at $step: $msg"
+    mkdir -p "$(dirname "$STATE_FILE")"
+    printf '{"state":"error","error":{"code":%s,"step":%s,"message":%s},"updated_at":%s}\n' \
+        "$(jsonq "$code")" "$(jsonq "$step")" "$(jsonq "$msg")" "$(jsonq "$(date -u +%FT%TZ)")" \
+        > "$STATE_FILE"
+    if command -v python3 >/dev/null 2>&1; then
+        emit_agent_result "error" \
+            "$(python3 -c 'import json,sys; print(json.dumps({"code":sys.argv[1],"step":sys.argv[2],"message":sys.argv[3]}))' \
+                "$code" "$step" "$msg")" || true
+    fi
+    exit 1
 }
 
 # -- step: python ----------------------------------------------------------
@@ -211,4 +374,5 @@ else
     write_state "needs_credentials" '"missing":["MT5_LOGIN","MT5_PASSWORD","MT5_SERVER"]'
     log "install complete: state=needs_credentials (broker credentials missing)"
 fi
+emit_agent_result
 exit 0

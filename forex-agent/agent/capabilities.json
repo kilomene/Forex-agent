@@ -1,30 +1,169 @@
 {
   "name": "forex-agent",
   "version": "0.1.0",
-  "generated_at": "2026-09-21T13:09:04.337248+00:00",
+  "contract_version": "1.0.0",
+  "platform": "linux",
+  "description": "Agent-native forex trading subsystem: deterministic market analysis and signal detection, plus a dry-run-by-default execution gateway. Exposed over MCP (stdio), a CLI, and a loopback-only local HTTP API with an SSE agent event channel.",
+  "generated_at": "2026-09-21T14:11:21.431357+00:00",
   "interfaces": {
     "mcp": {
       "transport": "JSON-RPC 2.0 over stdio",
       "command": "python3 -m agent.mcp.server",
+      "working_directory": "<forex-agent root>",
       "methods": [
         "initialize",
         "ping",
         "tools/list",
         "tools/call"
-      ]
+      ],
+      "notes": "stdio transport: the host agent spawns this command and speaks JSON-RPC on its stdin/stdout."
     },
     "cli": {
       "command": "scripts/forex",
-      "notes": "11 commands; --json on every command; exit 0/1/2."
+      "path": "<forex-agent root>/scripts/forex",
+      "working_directory": "<forex-agent root>",
+      "global_flags": [
+        "--json"
+      ],
+      "exit_codes": {
+        "0": "ok",
+        "1": "command failed",
+        "2": "usage error"
+      },
+      "commands": [
+        "status",
+        "health",
+        "broker-status",
+        "signals",
+        "signal",
+        "positions",
+        "account",
+        "analyze",
+        "risk",
+        "performance",
+        "events",
+        "config",
+        "kill-switch"
+      ],
+      "examples": [
+        "scripts/forex status --json",
+        "scripts/forex health --json",
+        "scripts/forex broker-status --json",
+        "scripts/forex signals --json --limit 5",
+        "scripts/forex events --json --since-id <event_id>",
+        "scripts/forex events --since-id <event_id> --follow",
+        "scripts/forex config --json",
+        "scripts/forex kill-switch --json"
+      ],
+      "notes": "13 commands; --json on every command for machine-readable output. config output is redacted (secrets never printed)."
     },
-    "http": {
+    "local_api": {
       "bind": "127.0.0.1 only (loopback; this IS the access control)",
       "command": "python3 scripts/local_api.py [--port PORT]",
-      "routes": [
-        "GET /health /status /signals /positions /account /performance /events",
-        "POST /analyze /trade/request /position/close /position/modify"
-      ]
+      "port_env": "FOREX_API_PORT",
+      "default_port": 8765,
+      "base_url": "http://127.0.0.1:${FOREX_API_PORT:-8765}",
+      "endpoints": {
+        "GET": [
+          "/health",
+          "/status",
+          "/signals",
+          "/positions",
+          "/account",
+          "/performance",
+          "/events",
+          "/events/latest"
+        ],
+        "POST": [
+          "/analyze",
+          "/trade/request",
+          "/position/close",
+          "/position/modify"
+        ]
+      },
+      "notes": "POST routes dispatch to the same tool registry as MCP/CLI; trade-affecting routes go through core.execution.gateway with dry-run and kill-switch enforcement."
+    },
+    "events": {
+      "sse_endpoint": "http://127.0.0.1:${FOREX_API_PORT:-8765}/events",
+      "accept_header": "text/event-stream",
+      "params": {
+        "resume_from": "<event_id> \u2014 replay every event journaled after it (oldest first), then stream live",
+        "ack": "<event_id> \u2014 cumulative acknowledgement (this event and everything journaled at/before it)"
+      },
+      "resume_semantics": "Unknown resume_from/ack event_id \u2192 HTTP 400. No resume_from \u2192 only events from connect time are streamed. Frames carry `id:` = event_id and `data:` = one JSON line {event_id, event, severity, timestamp, payload}.",
+      "poll_fallback": {
+        "endpoint": "http://127.0.0.1:${FOREX_API_PORT:-8765}/events/latest",
+        "params": "since=<event_id> (optional)",
+        "response": "{ok, count, events[], last_event_id}"
+      },
+      "cli": "scripts/forex events [--since-id <event_id>] [--follow] [--limit N]"
     }
+  },
+  "lifecycle": {
+    "install": {
+      "command": "installer/install.sh",
+      "flags": [
+        "--prefix DIR",
+        "--non-interactive",
+        "--skip-daemons",
+        "--system",
+        "--source DIR",
+        "--agent",
+        "--json"
+      ],
+      "notes": "--agent/--json prints a machine-readable install result (see docs/CAPABILITY.md); the installer is idempotent and never overwrites secrets."
+    },
+    "start": "scripts/forex-daemons start",
+    "stop": "scripts/forex-daemons stop",
+    "restart": "scripts/forex-daemons restart",
+    "status": [
+      "scripts/forex-daemons status",
+      "scripts/forex status --json"
+    ],
+    "health": "scripts/forex health --json",
+    "logs": "$FOREX_AGENT_HOME/log/<daemon>.log",
+    "states": [
+      "installed",
+      "configured",
+      "operational",
+      "broker_disconnected",
+      "broker_connected",
+      "trading_disabled",
+      "trading_ready",
+      "needs_credentials",
+      "error"
+    ],
+    "state_notes": "Reported by installer/install.sh --agent from real probes: trading_ready only when the broker probe reports connected + trading_available with mode=live and the kill switch clear; broker_disconnected when the subsystem is up but the broker probe fails (analysis-only mode, honest errors)."
+  },
+  "broker": {
+    "status_command": "scripts/forex broker-status --json",
+    "http": "GET /status \u2192 broker_status",
+    "fields": {
+      "provider": "adapter name: mt5 | disconnected",
+      "configured": "a broker provider is selected",
+      "reachable": "the broker runtime answers",
+      "connected": "logged in to the broker",
+      "account_available": "account snapshot readable",
+      "market_data_available": "price/candle feed readable",
+      "trading_available": "terminal allows order submission",
+      "detail": "reason dict when any flag is degraded"
+    },
+    "notes": "connected=true is 'logged in', not 'trading works'. Disconnected broker \u2192 honest errors, never invented data."
+  },
+  "mode": {
+    "values": [
+      "dry_run",
+      "live"
+    ],
+    "default": "dry_run",
+    "source": "DRY_RUN env (default true) or config 'mode'",
+    "command": "scripts/forex config --json  # -> config.mode",
+    "notes": "Dry-run is the default and blocks real order submission at the gateway. Live mode additionally requires broker credentials and a connected broker."
+  },
+  "registration": {
+    "mechanism": "manifest",
+    "manifest_path": "agent/capabilities.json",
+    "note": "This manifest IS the registration. The host agent reads it and wires whichever interface fits its runtime \u2014 MCP server config, CLI wrapper, or local-API client. There are no vendor-specific installer files and none are needed."
   },
   "tools": [
     {
@@ -298,6 +437,9 @@
           },
           "idempotency_key": {
             "type": "string"
+          },
+          "request_id": {
+            "type": "string"
           }
         },
         "additionalProperties": false,
@@ -312,11 +454,14 @@
     },
     {
       "name": "forex.close_position",
-      "description": "Close an open position by ticket. CURRENTLY UNAVAILABLE: core.execution.gateway exposes no close API yet; returns DEPENDENCY_UNAVAILABLE rather than bypassing the gateway.",
+      "description": "Close an open position by ticket through the execution gateway (audit-logged; broker-confirmed close price returned). Allowed even while the kill switch is engaged (closing reduces risk). Repeating a request_id returns the original result \u2014 never a second close.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "ticket": {
+            "type": "string"
+          },
+          "request_id": {
             "type": "string"
           }
         },
@@ -329,7 +474,7 @@
     },
     {
       "name": "forex.modify_position",
-      "description": "Modify SL/TP on an open position. CURRENTLY UNAVAILABLE: core.execution.gateway exposes no modify API yet; returns DEPENDENCY_UNAVAILABLE rather than bypassing the gateway.",
+      "description": "Modify SL/TP on an open position through the execution gateway. Mandatory SL is enforced (tighten only, never loosen or remove). Blocked while the kill switch is engaged. Repeating a request_id returns the original result \u2014 never a second modify.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -341,6 +486,9 @@
           },
           "take_profit": {
             "type": "number"
+          },
+          "request_id": {
+            "type": "string"
           }
         },
         "additionalProperties": false,
