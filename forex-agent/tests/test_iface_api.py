@@ -116,17 +116,19 @@ class TestLocalApi(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertIn("error_code", payload)
 
-    def test_post_position_close_unavailable(self):
+    def test_post_position_close_broker_down(self):
+        # Disconnected broker: the gateway reports BROKER_UNAVAILABLE
+        # (structured), never a silent failure or a fake fill.
         status, payload = _http("POST", self.url("/position/close"),
                                 {"ticket": "123"})
         self.assertEqual(status, 422)
-        self.assertEqual(payload["error_code"], "DEPENDENCY_UNAVAILABLE")
+        self.assertEqual(payload["error_code"], "BROKER_UNAVAILABLE")
 
-    def test_post_position_modify_unavailable(self):
+    def test_post_position_modify_broker_down(self):
         status, payload = _http("POST", self.url("/position/modify"),
                                 {"ticket": "123", "stop_loss": 1.09})
         self.assertEqual(status, 422)
-        self.assertEqual(payload["error_code"], "DEPENDENCY_UNAVAILABLE")
+        self.assertEqual(payload["error_code"], "BROKER_UNAVAILABLE")
 
     def test_post_invalid_json_400(self):
         req = urllib.request.Request(self.url("/analyze"), data=b"{oops",

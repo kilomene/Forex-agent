@@ -165,3 +165,20 @@ class FakeGateway:
             approved=True, reason="approved", reason_code="",
             idempotency_key=req.idempotency_key, volume=req.volume or 0.1,
             ticket=777001, price=1.1000)
+
+    def close_position(self, ticket, source="agent"):
+        """Mirrors ExecutionGateway.close_position: broker-confirmed dict."""
+        self.calls.append(("close", ticket, source))
+        return {"ok": True, "error_code": "", "message": "broker-confirmed close",
+                "ticket": ticket, "symbol": "EURUSD", "close_price": 1.1050}
+
+    def modify_position(self, ticket, stop_loss=None, take_profit=None,
+                        source="agent"):
+        """Mirrors ExecutionGateway.modify_position: mandatory-SL enforced."""
+        self.calls.append(("modify", ticket, stop_loss, take_profit, source))
+        if stop_loss is not None and stop_loss <= 0:
+            return {"ok": False, "error_code": "INVALID_ORDER",
+                    "message": "stop_loss is mandatory and must stay positive"}
+        return {"ok": True, "error_code": "", "message": "broker-confirmed modify",
+                "ticket": ticket, "symbol": "EURUSD",
+                "stop_loss": stop_loss, "take_profit": take_profit}

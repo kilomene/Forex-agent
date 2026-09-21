@@ -323,16 +323,20 @@ class TestTrading(BaseToolTest):
         self.assertFalse(second.get("ok", True))
         self.assertEqual(second["error_code"], "DUPLICATE_REQUEST")
 
-    def test_close_and_modify_honestly_unavailable(self):
-        """No close/modify API exists on core.execution.gateway yet; the
-        tools degrade to DEPENDENCY_UNAVAILABLE rather than bypassing the
-        gateway with direct adapter calls."""
+    def test_close_and_modify_route_through_gateway(self):
+        """forex.close_position / forex.modify_position route through the
+        execution gateway — never the broker adapter directly (the fake
+        broker raises AssertionError on any direct call)."""
         close = tool("forex.close_position")(12345)
-        self.assertFalse(close.get("ok", True))
-        self.assertEqual(close["error_code"], "DEPENDENCY_UNAVAILABLE")
+        self.assertTrue(close.get("ok"), close)
+        self.assertEqual(close["close_price"], 1.1050)
         modify = tool("forex.modify_position")(12345, stop_loss=1.0990)
-        self.assertFalse(modify.get("ok", True))
-        self.assertEqual(modify["error_code"], "DEPENDENCY_UNAVAILABLE")
+        self.assertTrue(modify.get("ok"), modify)
+        self.assertEqual(modify["stop_loss"], 1.0990)
+        # Mandatory SL: the gateway refuses SL removal.
+        bad = tool("forex.modify_position")(12345, stop_loss=0)
+        self.assertFalse(bad.get("ok", True))
+        self.assertEqual(bad["error_code"], "INVALID_ORDER")
         self.assertEqual(self.broker.submit_calls, [])
 
     def test_kill_switch_engages_latch(self):
