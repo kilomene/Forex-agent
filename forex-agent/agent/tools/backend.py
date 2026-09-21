@@ -5,6 +5,11 @@ Conventions (non-negotiable):
   * Trade-affecting calls go through ``gateway()`` (core.execution.gateway)
     ONLY. Read-only tools may use ``broker_adapter()``; trading tools must
     not touch it — enforced by tests/test_iface_tools.py.
+  * ``broker_adapter()`` returns the adapter wrapped in
+    core.execution.broker_guard.GatewayOnlyAdapter: direct
+    submit_order/modify_order/close_position calls from ANY consumer
+    raise GATEWAY_BYPASS_ATTEMPTED unless inside the gateway's
+    execution_scope(). Read methods pass through untouched.
   * Storage goes through ``store()`` -> ``from storage import Store``.
 
 All lazy imports are cross-area dependencies recorded in agent/API_DEPS.md
@@ -98,13 +103,17 @@ def _build_adapter():
 
 
 def broker_adapter():
-    """The configured BrokerAdapter (cached). Read-only tools use this;
-    trading tools MUST go through gateway() instead."""
+    """The configured BrokerAdapter (cached), wrapped in the broker
+    write-guard. Read-only tools use this freely; any direct
+    submit_order/modify_order/close_position call raises
+    GATEWAY_BYPASS_ATTEMPTED — trade-affecting calls MUST go through
+    gateway() instead."""
     global _adapter_cache
     if "broker" in _overrides:
         return _overrides["broker"]
     if _adapter_cache is None:
-        _adapter_cache = _build_adapter()
+        from core.execution.broker_guard import GatewayOnlyAdapter  # noqa: PLC0415
+        _adapter_cache = GatewayOnlyAdapter(_build_adapter())
     return _adapter_cache
 
 
@@ -129,12 +138,12 @@ def gateway():
     """core.execution.gateway — the ExecutionGateway, constructed once per
     process from config + broker adapter + RiskManager + KillSwitch + store.
 
-    Trade-affecting calls: gateway.request_trade(TradeRequest(...)) ->
-    GatewayDecision. Kill switch: gateway.kill_switch.engage/disengage/
-    is_engaged()/state(). There is NO close/modify API on the gateway —
-    forex.close_position / forex.modify_position therefore degrade to
-    DEPENDENCY_UNAVAILABLE until the execution builder exposes them
-    (see agent/API_DEPS.md).
+    Trade-affecting calls:
+      gateway.request_trade(TradeRequest(...)) -> GatewayDecision
+      gateway.modify_position(ticket, stop_loss=..., take_profit=...,
+                              source=..., request_id=...) -> dict
+      gateway.close_position(ticket, source=..., request_id=...) -> dict
+    Kill switch: gateway.kill_switch.engage/disengage/is_engaged()/state().
     """
     global _gateway_cache
     if "gateway" in _overrides:

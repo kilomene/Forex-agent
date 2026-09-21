@@ -15,6 +15,7 @@ from typing import Optional
 
 from broker import BrokerAdapter, is_own_position
 from core.events import emit
+from core.execution.broker_guard import execution_scope
 
 logger = logging.getLogger("kill_switch")
 
@@ -115,7 +116,10 @@ class KillSwitch:
             if not is_own_position(pos.magic):
                 continue
             try:
-                price = self._adapter.close_position(pos.ticket)
+                # execution_scope: the kill-switch sweep is the one
+                # non-gateway writer the broker guard allows.
+                with execution_scope():
+                    price = self._adapter.close_position(pos.ticket)
                 closed += 1
                 results.append({"ticket": pos.ticket, "symbol": pos.symbol,
                                 "ok": True, "close_price": price})
