@@ -1,0 +1,32 @@
+[Unit]
+Description=Forex agent notification bridge (SSE -> host-agent sink)
+Documentation=file:///opt/forex-agent/docs/OPERATIONS.md
+After=network.target forex-local-api.service
+Wants=forex-local-api.service
+PartOf=forex-agent.target
+
+[Service]
+Type=simple
+User=forex
+# Install location of the forex-agent tree (override with
+# systemctl edit if installed elsewhere).
+WorkingDirectory=/opt/forex-agent
+Environment=FOREX_AGENT_HOME=/var/lib/forex-agent
+Environment=FOREX_AGENT_STORAGE=/var/lib/forex-agent/storage/local.db
+Environment=FOREX_API_PORT=8765
+# Optional: host-agent sink command. When set, the bridge spawns this
+# argv (no shell) and streams NDJSON event envelopes on its stdin.
+# When unset, the bridge tails the stream and maintains its cursor but
+# delivers nowhere (reported as agent_notification=unconfigured).
+#Environment=FOREX_AGENT_NOTIFICATION_COMMAND=
+# Single instance via pidfile; reconnects to the API with backoff if the
+# API server restarts.
+ExecStart=/usr/bin/python3 -m agent.events.bridge
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=forex-agent.target

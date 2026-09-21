@@ -1,0 +1,26 @@
+[Unit]
+Description=Forex agent local API + SSE event stream (loopback only)
+Documentation=file:///opt/forex-agent/docs/OPERATIONS.md
+After=network.target
+PartOf=forex-agent.target
+
+[Service]
+Type=simple
+User=forex
+# Install location of the forex-agent tree (override with
+# systemctl edit if installed elsewhere).
+WorkingDirectory=/opt/forex-agent
+Environment=FOREX_AGENT_HOME=/var/lib/forex-agent
+Environment=FOREX_AGENT_STORAGE=/var/lib/forex-agent/storage/local.db
+Environment=FOREX_API_PORT=8765
+# Single instance: scripts/local_api.py takes a pidfile and a second
+# process exits quietly, so two servers can never fight over the port.
+ExecStart=/usr/bin/python3 scripts/local_api.py --port 8765
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=forex-agent.target

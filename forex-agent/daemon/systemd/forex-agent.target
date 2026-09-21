@@ -1,6 +1,6 @@
 [Unit]
-Description=Forex agent daemons (market/signal/position/health monitors)
-Wants=forex-market_monitor.service forex-signal_monitor.service forex-position_monitor.service forex-health_monitor.service
+Description=Forex agent services (monitors, local API/SSE, notification bridge)
+Wants=forex-market_monitor.service forex-signal_monitor.service forex-position_monitor.service forex-health_monitor.service forex-local-api.service forex-agent-bridge.service
 
 [Install]
 WantedBy=multi-user.target
