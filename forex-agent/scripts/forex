@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""forex — command-line interface for the Forex-agent subsystem.
+
+Every command supports --json (machine-readable output). Without --json
+the output is a compact human-readable summary. Exit codes: 0 ok,
+1 tool/dependency error, 2 CLI usage error.
+
+Commands:
+  status                      one-line subsystem summary
+  health                      full component health (forex.get_health)
+  signals [--status S] [--limit N]
+  signal <signal_id>
+  positions
+  account
+  analyze <symbol> [--timeframe TF]
+  risk [--symbol S --direction D --lot-size V --stop-distance X]
+  performance [--lookback-days N]
+  events [--limit N] [--since ISO]
+  config                      effective config (secrets redacted)
+  kill-switch [--engage|--clear] [--reason TEXT]
+
+Environment: FOREX_AGENT_HOME, FOREX_AGENT_STORAGE, BROKER_PROVIDER, etc.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+# Allow running from the forex-agent directory or an installed location.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from agent.tools import registry  # noqa: E402
+
+
+def _out(data, as_json: bool) -> int:
+    if as_json:
+        print(json.dumps(data, indent=2, default=str))
+    else:
+        _pretty(data)
+    ok = data.get("ok", True) if isinstance(data, dict) else True
+    return 0 if ok else 1
+
+
+def _pretty(data, indent: int = 0) -> None:
+    pad = "  " * indent
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if isinstance(value, (dict, list)):
+                print("%s%s:" % (pad, key))
+                _pretty(value, indent + 1)
+            else:
+                print("%s%s: %s" % (pad, key, value))
+    elif isinstance(data, list):
+        for item in data[:50]:
+            if isinstance(item, (dict, list)):
+                print("%s-" % pad)
+                _pretty(item, indent + 1)
+            else:
+                print("%s- %s" % (pad, item))
+        if len(data) > 50:
+            print("%s... (%d more)" % (pad, len(data) - 50))
+    else:
+        print("%s%s" % (pad, data))
+
+
+def cmd_status(args) -> int:
+    health = registry.call("forex.get_health", {})
+    account = registry.call("forex.get_account", {})
+    positions = registry.call("forex.get_positions", {})
+    data = {
+        "ok": bool(health.get("ok") and account.get("ok")),
+        "status": health.get("status"),
+        "kill_switch_engaged": health.get("components", {}).get(
+            "kill_switch", {}).get("detail", {}).get("engaged"),
+        "equity": (account.get("account") or {}).get("equity"),
+        "currency": (account.get("account") or {}).get("currency"),
+        "open_positions": positions.get("count"),
+        "components": {k: v.get("status")
+                       for k, v in health.get("components", {}).items()},
+    }
+    return _out(data, args.json)
+
+
+def cmd_health(args) -> int:
+    return _out(registry.call("forex.get_health", {}), args.json)
+
+
+def cmd_signals(args) -> int:
+    params = {"limit": args.limit}
+    if args.status:
+        params["status"] = args.status
+    return _out(registry.call("forex.get_signals", params), args.json)
+
+
+def cmd_signal(args) -> int:
+    return _out(registry.call("forex.get_signal",
+                             {"signal_id": args.signal_id}), args.json)
+
+
+def cmd_positions(args) -> int:
+    return _out(registry.call("forex.get_positions", {}), args.json)
+
+
+def cmd_account(args) -> int:
+    return _out(registry.call("forex.get_account", {}), args.json)
+
+
+def cmd_analyze(args) -> int:
+    return _out(registry.call("forex.analyze", {"symbol": args.symbol,
+                                               "timeframe": args.timeframe}),
+                args.json)
+
+
+def cmd_risk(args) -> int:
+    params = {}
+    if args.symbol:
+        params["symbol"] = args.symbol
+    if args.direction:
+        params["direction"] = args.direction
+    if args.lot_size is not None:
+        params["lot_size"] = args.lot_size
+    if args.stop_distance is not None:
+        params["stop_loss_distance"] = args.stop_distance
+    return _out(registry.call("forex.get_risk", params), args.json)
+
+
+def cmd_performance(args) -> int:
+    return _out(registry.call("forex.get_performance",
+                              {"lookback_days": args.lookback_days}), args.json)
+
+
+def cmd_events(args) -> int:
+    from agent.events.bus import poll  # noqa: PLC0415
+    try:
+        events = poll(limit=args.limit, since=args.since)
+    except ValueError as exc:
+        return _out({"ok": False, "error_code": "INVALID_ARGUMENT",
+                     "message": str(exc)}, args.json)
+    return _out({"ok": True, "count": len(events), "events": events}, args.json)
+
+
+def _redact(value):
+    if isinstance(value, dict):
+        return {k: ("***" if any(s in k.lower() for s in
+                                 ("password", "secret", "api_key", "apikey", "token"))
+                    else _redact(v))
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact(v) for v in value]
+    return value
+
+
+def cmd_config(args) -> int:
+    from agent.tools import backend  # noqa: PLC0415
+    import dataclasses  # noqa: PLC0415
+    try:
+        cfg = backend.app_config()
+    except RuntimeError as exc:
+        return _out(backend.dep_unavailable("config", exc), args.json)
+    data = dataclasses.asdict(cfg) if dataclasses.is_dataclass(cfg) else dict(cfg)
+    return _out({"ok": True, "config": _redact(data)}, args.json)
+
+
+def cmd_kill_switch(args) -> int:
+    if args.engage and args.clear:
+        print("error: --engage and --clear are mutually exclusive", file=sys.stderr)
+        return 2
+    engage = not args.clear  # default (no flag) shows state via engage dry path
+    if not args.engage and not args.clear:
+        # No flag: report current latch state without changing it.
+        from agent.tools import backend  # noqa: PLC0415
+        try:
+            state = backend.store().get_kill_switch()
+        except Exception as exc:  # noqa: BLE001
+            return _out({"ok": False, "error_code": "DEPENDENCY_UNAVAILABLE",
+                         "message": str(exc)}, args.json)
+        return _out({"ok": True, "engaged": bool(state.get("engaged")),
+                     "source": state.get("source")}, args.json)
+    return _out(registry.call("forex.kill_switch",
+                             {"engage": engage, "reason": args.reason}), args.json)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    json_parent = argparse.ArgumentParser(add_help=False)
+    json_parent.add_argument("--json", action="store_true",
+                             help="machine-readable JSON output")
+    parser = argparse.ArgumentParser(prog="forex",
+                                     description="Forex-agent subsystem CLI",
+                                     parents=[json_parent])
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def sp(name, **kw):
+        kw.setdefault("parents", [json_parent])
+        return sub.add_parser(name, **kw)
+
+    sp("status").set_defaults(func=cmd_status)
+    sp("health").set_defaults(func=cmd_health)
+
+    p = sp("signals")
+    p.add_argument("--status", default=None)
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(func=cmd_signals)
+
+    p = sp("signal")
+    p.add_argument("signal_id")
+    p.set_defaults(func=cmd_signal)
+
+    sp("positions").set_defaults(func=cmd_positions)
+    sp("account").set_defaults(func=cmd_account)
+
+    p = sp("analyze")
+    p.add_argument("symbol")
+    p.add_argument("--timeframe", default="M15")
+    p.set_defaults(func=cmd_analyze)
+
+    p = sp("risk")
+    p.add_argument("--symbol", default=None)
+    p.add_argument("--direction", default=None)
+    p.add_argument("--lot-size", type=float, default=None)
+    p.add_argument("--stop-distance", type=float, default=None)
+    p.set_defaults(func=cmd_risk)
+
+    p = sp("performance")
+    p.add_argument("--lookback-days", type=int, default=30)
+    p.set_defaults(func=cmd_performance)
+
+    p = sp("events")
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--since", default=None)
+    p.set_defaults(func=cmd_events)
+
+    sp("config").set_defaults(func=cmd_config)
+
+    p = sp("kill-switch")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--engage", action="store_true")
+    group.add_argument("--clear", action="store_true")
+    p.add_argument("--reason", default=None)
+    p.set_defaults(func=cmd_kill_switch)
+
+    return parser
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except BrokenPipeError:
+        return 0
+    except Exception as exc:  # noqa: BLE001 — CLI never tracebacks
+        print(json.dumps({"ok": False, "error_code": "INTERNAL_ERROR",
+                          "message": str(exc)}))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
