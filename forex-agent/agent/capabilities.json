@@ -1,10 +1,10 @@
 {
   "name": "forex-agent",
   "version": "0.1.0",
-  "contract_version": "1.0.0",
+  "contract_version": "1.1.0",
   "platform": "linux",
   "description": "Agent-native forex trading subsystem: deterministic market analysis and signal detection, plus a dry-run-by-default execution gateway. Exposed over MCP (stdio), a CLI, and a loopback-only local HTTP API with an SSE agent event channel.",
-  "generated_at": "2026-09-21T14:11:21.431357+00:00",
+  "generated_at": "2026-09-21T15:24:40.490430+00:00",
   "interfaces": {
     "mcp": {
       "transport": "JSON-RPC 2.0 over stdio",
@@ -113,7 +113,7 @@
       ],
       "notes": "--agent/--json prints a machine-readable install result (see docs/CAPABILITY.md); the installer is idempotent and never overwrites secrets."
     },
-    "start": "scripts/forex-daemons start",
+    "start": "scripts/forex-daemons start  # daemons + local_api + agent_bridge",
     "stop": "scripts/forex-daemons stop",
     "restart": "scripts/forex-daemons restart",
     "status": [
@@ -121,7 +121,7 @@
       "scripts/forex status --json"
     ],
     "health": "scripts/forex health --json",
-    "logs": "$FOREX_AGENT_HOME/log/<daemon>.log",
+    "logs": "$FOREX_AGENT_HOME/log/<service>.log",
     "states": [
       "installed",
       "configured",
@@ -159,6 +159,51 @@
     "source": "DRY_RUN env (default true) or config 'mode'",
     "command": "scripts/forex config --json  # -> config.mode",
     "notes": "Dry-run is the default and blocks real order submission at the gateway. Live mode additionally requires broker credentials and a connected broker."
+  },
+  "agent_notification": {
+    "mechanism": "persistent notification bridge -> host-provided sink",
+    "bridge": {
+      "command": "python3 -m agent.events.bridge",
+      "managed_by": [
+        "scripts/forex-daemons (service: agent_bridge)",
+        "systemd: forex-agent-bridge.service"
+      ],
+      "source": "SSE GET /events with resume_from=<event_id>",
+      "cursor": "$FOREX_AGENT_HOME/run/agent-event.cursor",
+      "delivery": "at-least-once; event_id dedup; exactly-once is NOT claimed",
+      "reconnect": "automatic, exponential backoff 1s..60s (API restart, connection reset, daemon restart)"
+    },
+    "sink_contract": {
+      "class": "agent.events.bridge.AgentNotificationSink",
+      "operations": [
+        "deliver(event)  # raise when not accepted",
+        "health()  # secret-free status dict"
+      ],
+      "note": "Forex provides the bridge and this contract; the HOST provides the sink implementation. No vendor-specific code and no assumed host HTTP API (there is no POST /agent/notify)."
+    },
+    "generic_sink": {
+      "env": "FOREX_AGENT_NOTIFICATION_COMMAND",
+      "transport": "argv-based subprocess (never shell=True); NDJSON event envelopes on stdin",
+      "envelope": "{event_id, event, severity, timestamp, payload}",
+      "executable_validation": "absolute paths must exist and be executable; bare names resolve via PATH",
+      "security": "no shell=True; payloads never carry secrets; the child inherits the bridge environment \u2014 do not put secrets in the command line"
+    },
+    "guarantees": {
+      "forex_guarantees": [
+        "event generated",
+        "event journaled",
+        "event stream available",
+        "bridge running"
+      ],
+      "cannot_guarantee": [
+        "that the host model woke up \u2014 that depends on the host-provided sink integration"
+      ]
+    },
+    "installer_states": {
+      "configured": "bridge running and a sink command is set",
+      "unconfigured": "bridge running, no sink (cursor tracked, nothing proactively delivered)",
+      "unavailable": "bridge not running"
+    }
   },
   "registration": {
     "mechanism": "manifest",
@@ -537,6 +582,22 @@
       "name": "health_monitor",
       "description": "Fail-closed kill-switch poll (10s), Worker sync, 6h performance sync.",
       "interval_seconds": 10
+    }
+  ],
+  "services": [
+    {
+      "name": "local_api",
+      "description": "Loopback HTTP API + SSE agent event channel (python3 scripts/local_api.py --port $FOREX_API_PORT).",
+      "command": "python3 scripts/local_api.py [--port PORT]",
+      "port_env": "FOREX_API_PORT",
+      "default_port": 8765
+    },
+    {
+      "name": "agent_bridge",
+      "description": "Persistent agent notification bridge: subscribes to the SSE stream and proactively delivers each event to the host-agent sink (python3 -m agent.events.bridge).",
+      "command": "python3 -m agent.events.bridge",
+      "cursor": "$FOREX_AGENT_HOME/run/agent-event.cursor",
+      "delivery": "at-least-once (event_id dedup; exactly-once NOT claimed)"
     }
   ],
   "safety_invariants": [

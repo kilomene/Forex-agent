@@ -31,7 +31,7 @@ MANIFEST_PATH = os.path.join(
 
 # Version of the capability-contract schema itself (independent of the
 # subsystem version). Bump when a section is added/renamed/removed.
-CONTRACT_VERSION = "1.0.0"
+CONTRACT_VERSION = "1.1.0"
 
 API_PORT_ENV = "FOREX_API_PORT"
 API_DEFAULT_PORT = 8765
@@ -50,6 +50,24 @@ DAEMONS = [
     {"name": "health_monitor",
      "description": "Fail-closed kill-switch poll (10s), Worker sync, 6h performance sync.",
      "interval_seconds": 10},
+]
+
+# Managed services beyond the four monitors (scripts/forex-daemons and
+# the forex-local-api / forex-agent-bridge systemd units manage these).
+SERVICES = [
+    {"name": "local_api",
+     "description": "Loopback HTTP API + SSE agent event channel "
+                    "(python3 scripts/local_api.py --port $FOREX_API_PORT).",
+     "command": "python3 scripts/local_api.py [--port PORT]",
+     "port_env": API_PORT_ENV,
+     "default_port": API_DEFAULT_PORT},
+    {"name": "agent_bridge",
+     "description": "Persistent agent notification bridge: subscribes to "
+                    "the SSE stream and proactively delivers each event to "
+                    "the host-agent sink (python3 -m agent.events.bridge).",
+     "command": "python3 -m agent.events.bridge",
+     "cursor": "$FOREX_AGENT_HOME/run/agent-event.cursor",
+     "delivery": "at-least-once (event_id dedup; exactly-once NOT claimed)"},
 ]
 
 
@@ -171,7 +189,7 @@ def build_manifest() -> dict:
                          "result (see docs/CAPABILITY.md); the installer is "
                          "idempotent and never overwrites secrets.",
             },
-            "start": "scripts/forex-daemons start",
+            "start": "scripts/forex-daemons start  # daemons + local_api + agent_bridge",
             "stop": "scripts/forex-daemons stop",
             "restart": "scripts/forex-daemons restart",
             "status": [
@@ -179,7 +197,7 @@ def build_manifest() -> dict:
                 "scripts/forex status --json",
             ],
             "health": "scripts/forex health --json",
-            "logs": "$FOREX_AGENT_HOME/log/<daemon>.log",
+            "logs": "$FOREX_AGENT_HOME/log/<service>.log",
             "states": [
                 "installed",
                 "configured",
@@ -224,6 +242,61 @@ def build_manifest() -> dict:
                      "submission at the gateway. Live mode additionally "
                      "requires broker credentials and a connected broker.",
         },
+        "agent_notification": {
+            "mechanism": "persistent notification bridge -> host-provided sink",
+            "bridge": {
+                "command": "python3 -m agent.events.bridge",
+                "managed_by": [
+                    "scripts/forex-daemons (service: agent_bridge)",
+                    "systemd: forex-agent-bridge.service",
+                ],
+                "source": "SSE GET /events with resume_from=<event_id>",
+                "cursor": "$FOREX_AGENT_HOME/run/agent-event.cursor",
+                "delivery": "at-least-once; event_id dedup; exactly-once "
+                            "is NOT claimed",
+                "reconnect": "automatic, exponential backoff 1s..60s "
+                             "(API restart, connection reset, daemon restart)",
+            },
+            "sink_contract": {
+                "class": "agent.events.bridge.AgentNotificationSink",
+                "operations": ["deliver(event)  # raise when not accepted",
+                               "health()  # secret-free status dict"],
+                "note": "Forex provides the bridge and this contract; the "
+                        "HOST provides the sink implementation. No "
+                        "vendor-specific code and no assumed host HTTP API "
+                        "(there is no POST /agent/notify).",
+            },
+            "generic_sink": {
+                "env": "FOREX_AGENT_NOTIFICATION_COMMAND",
+                "transport": "argv-based subprocess (never shell=True); "
+                             "NDJSON event envelopes on stdin",
+                "envelope": "{event_id, event, severity, timestamp, payload}",
+                "executable_validation": "absolute paths must exist and be "
+                                         "executable; bare names resolve via "
+                                         "PATH",
+                "security": "no shell=True; payloads never carry secrets; "
+                            "the child inherits the bridge environment — do "
+                            "not put secrets in the command line",
+            },
+            "guarantees": {
+                "forex_guarantees": [
+                    "event generated",
+                    "event journaled",
+                    "event stream available",
+                    "bridge running",
+                ],
+                "cannot_guarantee": [
+                    "that the host model woke up — that depends on the "
+                    "host-provided sink integration",
+                ],
+            },
+            "installer_states": {
+                "configured": "bridge running and a sink command is set",
+                "unconfigured": "bridge running, no sink (cursor tracked, "
+                                "nothing proactively delivered)",
+                "unavailable": "bridge not running",
+            },
+        },
         "registration": {
             "mechanism": "manifest",
             "manifest_path": "agent/capabilities.json",
@@ -236,6 +309,7 @@ def build_manifest() -> dict:
         },
         "tools": tools,
         "daemons": DAEMONS,
+        "services": SERVICES,
         "safety_invariants": [
             "Dry-run by default; live trading cannot be casually enabled.",
             "Trade-affecting tools route only through core.execution.gateway.",
