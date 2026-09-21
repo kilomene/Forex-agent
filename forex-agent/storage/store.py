@@ -28,7 +28,7 @@ import json
 import os
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -347,6 +347,43 @@ class Store:
                 (event_id,),
             ).fetchone()
         return self._event_journal_entry(row) if row else None
+
+    def event_journal_prune(self, retention_days: int = 30,
+                            max_events: int = 100000) -> dict:
+        """Bounded pruning of the event delivery journal.
+
+        Deletes rows older than `retention_days`, then caps the table at
+        `max_events` newest rows. The bound is on *event_id* order (the
+        SSE replay order), so resume_from semantics stay intact: the
+        newest events — the ones a reconnecting consumer asks about —
+        are always kept. Returns {"pruned": n, "remaining": m}.
+
+        Pruning is config-driven (events.journal_retention_days /
+        events.journal_max_events) and runs from the supervisor safety
+        sequence, `scripts/forex-daemons prune`, and a systemd timer.
+        Non-positive values disable that bound (retention_days<=0 keeps
+        everything by age; max_events<=0 keeps everything by count).
+        """
+        retention_days = int(retention_days)
+        max_events = int(max_events)
+        pruned = 0
+        with self._lock:
+            if retention_days > 0:
+                cutoff = (datetime.now(timezone.utc)
+                          - timedelta(days=retention_days)).isoformat()
+                cur = self._conn.execute(
+                    "DELETE FROM event_journal WHERE ts < ?", (cutoff,))
+                pruned += cur.rowcount or 0
+            if max_events > 0:
+                cur = self._conn.execute(
+                    "DELETE FROM event_journal WHERE id NOT IN "
+                    "(SELECT id FROM event_journal ORDER BY id DESC LIMIT ?)",
+                    (max_events,))
+                pruned += cur.rowcount or 0
+            remaining = self._conn.execute(
+                "SELECT COUNT(*) FROM event_journal").fetchone()[0]
+            self._conn.commit()
+        return {"pruned": int(pruned), "remaining": int(remaining)}
 
     # -- execution idempotency (gateway request_id dedup, survives restart) --
     def idem_get(self, request_id: str) -> Optional[dict]:
