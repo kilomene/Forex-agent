@@ -30,6 +30,15 @@
 # Missing credentials are reported as {"status":"needs_credentials",
 # "required":[...]}; empty or whitespace-only values count as missing.
 #
+# The install result also reports the local API/SSE server honestly:
+# after starting services the installer REALLY probes
+# 127.0.0.1:$FOREX_API_PORT — TCP listen, GET /health, and an actual SSE
+# handshake on GET /events — and only then reports "events": "running"
+# (otherwise "unavailable"). "agent_notification" is "configured" when
+# the notification bridge is running AND FOREX_AGENT_NOTIFICATION_COMMAND
+# names a host-agent sink, "unconfigured" when the bridge runs without a
+# sink, and "unavailable" when the bridge is not running.
+#
 # Secrets (MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, WORKER_API_KEY) come from
 # the environment or an interactive prompt, and are written to
 # $FOREX_AGENT_HOME/secrets.env with mode 0600. They are never printed.
@@ -113,19 +122,69 @@ PYEOF
     return 0
 }
 
+# api_probe: REAL probes of the local API/SSE server. Prints one JSON line
+# {"tcp": bool, "health": bool, "sse": bool}; never fails the caller.
+#   tcp    127.0.0.1:$FOREX_API_PORT accepts a connection
+#   health GET /health -> 200 with {"ok": true}
+#   sse    GET /events (Accept: text/event-stream) -> 200,
+#          Content-Type text/event-stream, first frame readable
+api_probe() {
+    FOREX_API_PORT="${FOREX_API_PORT:-8765}" timeout 60 python3 - 2>/dev/null <<'PYEOF' | grep '^{' | tail -n 1
+import http.client
+import json
+import os
+import socket
+import urllib.request
+
+port = int(os.environ.get("FOREX_API_PORT", "8765"))
+out = {"tcp": False, "health": False, "sse": False}
+try:
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    sock.close()
+    out["tcp"] = True
+except OSError:
+    print(json.dumps(out))
+    raise SystemExit
+try:
+    with urllib.request.urlopen("http://127.0.0.1:%d/health" % port,
+                                timeout=10) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+        out["health"] = resp.status == 200 and body.get("ok") is True
+except Exception:
+    print(json.dumps(out))
+    raise SystemExit
+try:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.putrequest("GET", "/events")
+    conn.putheader("Accept", "text/event-stream")
+    conn.endheaders()
+    resp = conn.getresponse()
+    ctype_ok = "text/event-stream" in (resp.getheader("Content-Type") or "")
+    head = resp.fp.readline(4096) if resp.status == 200 and ctype_ok else b""
+    out["sse"] = resp.status == 200 and ctype_ok and len(head) > 0
+    conn.close()
+except Exception:
+    pass
+print(json.dumps(out))
+PYEOF
+    return 0
+}
+
 # emit_agent_result [status] [error_json]: derive the machine-readable
 # install result from real probes, write $PREFIX/install-result.json, and
 # print it on stdout when --agent/--json was passed. With no status the
 # status is derived; pass "error" explicitly from fail().
 emit_agent_result() {
     local status="${1:-}" err="${2:-null}"
-    local probe daemons_out
+    local probe daemons_out api_out
     probe="$(agent_probe)" || probe=""
     [ -n "$probe" ] || probe='{"probe_ok":false}'
     daemons_out="$(FOREX_AGENT_HOME="$PREFIX" timeout 30 ./scripts/forex-daemons status 2>/dev/null)" \
         || daemons_out=""
+    api_out="$(api_probe)" || api_out=""
+    [ -n "$api_out" ] || api_out='{"tcp":false,"health":false,"sse":false}'
     AGENT_STATUS="$status" AGENT_ERR="$err" AGENT_PROBE="$probe" \
-    AGENT_DAEMONS="$daemons_out" AGENT_PREFIX="$PREFIX" AGENT_SOURCE="$SOURCE" \
+    AGENT_DAEMONS="$daemons_out" AGENT_API="$api_out" AGENT_PREFIX="$PREFIX" AGENT_SOURCE="$SOURCE" \
     AGENT_OUT="$AGENT_OUT" \
     python3 - <<'PYEOF'
 import json, os
@@ -133,6 +192,7 @@ import json, os
 status = os.environ.get("AGENT_STATUS", "")
 err = json.loads(os.environ.get("AGENT_ERR") or "null")
 probe = json.loads(os.environ.get("AGENT_PROBE") or '{"probe_ok": false}')
+api = json.loads(os.environ.get("AGENT_API") or '{"tcp": false}')
 dstat = os.environ.get("AGENT_DAEMONS", "")
 prefix = os.environ["AGENT_PREFIX"]
 source = os.environ["AGENT_SOURCE"]
@@ -147,6 +207,24 @@ DAEMON_NAMES = ("market_monitor", "signal_monitor",
                 "position_monitor", "health_monitor")
 daemons_running = bool(dstat) and all(
     ("%s: running" % n) in dstat for n in DAEMON_NAMES)
+
+# The local API/SSE server is "running" only when it REALLY answers:
+# TCP accept + GET /health ok + a real SSE handshake on GET /events.
+api_running = bool(api.get("tcp")) and bool(api.get("health")) \
+    and bool(api.get("sse"))
+
+# Notification bridge: "configured" only when the bridge is up AND a
+# host-agent sink command is set; "unconfigured" when it runs without a
+# sink (cursor tracked, nothing proactively delivered); "unavailable"
+# when the bridge itself is not running.
+bridge_running = "agent_bridge: running" in dstat
+sink_cmd = (os.environ.get("FOREX_AGENT_NOTIFICATION_COMMAND") or "").strip()
+if bridge_running and sink_cmd:
+    agent_notification = "configured"
+elif bridge_running:
+    agent_notification = "unconfigured"
+else:
+    agent_notification = "unavailable"
 
 probe_ok = bool(probe.get("probe_ok")) and bool(probe.get("broker_probe_ok"))
 broker = probe.get("broker") if isinstance(probe.get("broker"), dict) else {}
@@ -186,7 +264,8 @@ result = {
     "kill_switch_engaged": (probe.get("kill_engaged")
                             if probe.get("probe_ok") else None),
     "signals": "unavailable" if status == "error" else "available",
-    "events": "running" if daemons_running else "stopped",
+    "events": "running" if api_running else "unavailable",
+    "agent_notification": agent_notification,
     "mcp": "unavailable" if status == "error" else "available",
     "daemons": daemons_running,
     "manifest": os.path.join(source, "agent", "capabilities.json"),
@@ -287,6 +366,11 @@ TIMEFRAME=\${TIMEFRAME:-H1}
 WORKER_ENABLED=\${WORKER_ENABLED:-false}
 WORKER_BASE_URL=\${WORKER_BASE_URL:-}
 DRY_RUN=\${DRY_RUN:-true}
+# Optional host-agent sink for the notification bridge: a command line
+# (parsed as argv, never a shell) whose stdin receives NDJSON event
+# envelopes. Empty = the bridge tails the stream and tracks its cursor
+# but delivers nowhere (install result: agent_notification=unconfigured).
+FOREX_AGENT_NOTIFICATION_COMMAND=\${FOREX_AGENT_NOTIFICATION_COMMAND:-}
 EOF
     log "wrote $ENV_FILE"
 fi
@@ -322,6 +406,13 @@ if [ "$SKIP_DAEMONS" -eq 0 ]; then
         fail "DAEMONS" "daemons" "could not start all daemons (see $PREFIX/log/)"
     fi
     log "daemons started"
+    # Notification bridge cursor: establish the file (location/ownership)
+    # at install time. The bridge creates and maintains it too; an empty
+    # file simply means "no cursor yet".
+    if [ ! -f "$PREFIX/run/agent-event.cursor" ]; then
+        : > "$PREFIX/run/agent-event.cursor"
+        log "created $PREFIX/run/agent-event.cursor"
+    fi
 else
     log "skipping daemon start (--skip-daemons)"
 fi
