@@ -8,7 +8,7 @@ and kill-switch latch persistence across store reopen. No MetaTrader5.
 """
 
 from dataclasses import replace
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -91,7 +91,7 @@ class FakeBroker:
         return [_spec()]
 
     def quote(self, symbol):
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         return Quote(symbol=symbol, bid=1.1000, ask=1.1000 + self.spread,
                      time=now - timedelta(seconds=self.tick_age))
 
