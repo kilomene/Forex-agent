@@ -4,14 +4,37 @@
 # Usage:
 #   forex-daemons start [daemon...]    start all (or named) daemons
 #   forex-daemons stop [daemon...]     stop all (or named) daemons
-#   forex-daemons restart [daemon...]  stop then start
+#   forex-daemons restart [daemon...]  stop, start, then run the restart
+#                                      safety sequence (state restore +
+#                                      reconcile + health report)
 #   forex-daemons status [daemon...]   show running state
+#   forex-daemons health [--json]      aggregate health: daemon liveness +
+#                                      kill-switch latch + broker_status +
+#                                      event-journal tail
+#   forex-daemons safety [--json]      run the restart safety sequence
+#                                      standalone (no process changes)
+#   forex-daemons prune                bounded event-journal pruning
+#                                      (config: events.journal_retention_days
+#                                      / events.journal_max_events)
+#   forex-daemons logs [daemon...] [--lines N] [--follow]
+#                                      tail daemon log files
 #
 # Idempotent: starting a running daemon is a no-op (exit 0); stopping a
 # stopped daemon is a no-op (exit 0). Daemons are Python processes run as
 # `python3 -m daemon.<name>` from the forex-agent root; each holds a PID
 # file in $FOREX_AGENT_HOME/run/<name>.pid. Stale PID files (dead process)
 # are reclaimed automatically.
+#
+# No duplicate daemons: a flock(2) lock serializes every mutating command
+# (start/stop/restart/prune/safety), and each daemon process re-checks
+# its PID file at startup (daemon.common.acquire_pidfile) — a second
+# launcher always loses and exits quietly.
+#
+# Daemon independence: daemons are launched detached via setsid+nohup in
+# their own session, so they survive the exit of whatever started them
+# (agent process, shell, installer). An agent restart is NOT a forex
+# restart — use `forex-daemons restart` (or the systemd units) to restart
+# the forex subsystem itself.
 #
 # Environment:
 #   FOREX_AGENT_HOME     agent home (default ~/.forex-agent)
@@ -22,9 +45,21 @@ DAEMONS="market_monitor signal_monitor position_monitor health_monitor"
 AGENT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HOME_DIR="${FOREX_AGENT_HOME:-$HOME/.forex-agent}"
 RUN_DIR="$HOME_DIR/run"
+LOG_DIR="$HOME_DIR/log"
 PYTHON="${PYTHON:-python3}"
+LOCK_FILE="$RUN_DIR/.supervisor.lock"
 
-mkdir -p "$RUN_DIR"
+mkdir -p "$RUN_DIR" "$LOG_DIR"
+
+# Serialize mutating commands so two concurrent invocations can never
+# launch duplicate daemons or interleave stop/start.
+with_lock() {
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+        echo "another forex-daemons operation is in progress (lock $LOCK_FILE)" >&2
+        exit 3
+    fi
+}
 
 pid_of() {  # pid_of <daemon> -> prints pid or nothing
     local pidfile="$RUN_DIR/$1.pid"
@@ -45,21 +80,25 @@ do_start_one() {
     # Reclaim a stale pidfile so the daemon can start cleanly.
     rm -f "$RUN_DIR/$name.pid"
     cd "$AGENT_ROOT" || return 1
+    # setsid: the daemon gets its own session and survives the exit of
+    # this script / the agent process that invoked it. nohup: immune to
+    # SIGHUP. </dev/null: never hold the caller's stdin. 9>&-: never
+    # inherit the supervisor lock (a daemon outliving the script must
+    # not keep the lock held forever).
     FOREX_AGENT_HOME="$HOME_DIR" FOREX_AGENT_STORAGE="${FOREX_AGENT_STORAGE:-$HOME_DIR/storage/local.db}" \
-        nohup "$PYTHON" -m "daemon.$name" >> "$HOME_DIR/log/$name.log" 2>&1 &
-    local launcher=$!
-    # Give it a moment to claim its pidfile, then verify.
-    sleep 1
-    if is_running "$name"; then
-        echo "$name: started (pid $(pid_of "$name"))"
-        return 0
-    fi
-    # Fall back to the launcher pid if the daemon died instantly.
-    if kill -0 "$launcher" 2>/dev/null; then
-        echo "$name: starting (launcher pid $launcher)"
-        return 0
-    fi
-    echo "$name: FAILED to start (see $HOME_DIR/log/$name.log)" >&2
+        setsid nohup "$PYTHON" -m "daemon.$name" >> "$LOG_DIR/$name.log" 2>&1 < /dev/null 9>&- &
+    # The daemon writes its own pidfile at startup (acquire_pidfile);
+    # poll for it instead of trusting the launcher pid.
+    local i=0
+    while [ "$i" -lt 20 ]; do
+        if is_running "$name"; then
+            echo "$name: started (pid $(pid_of "$name"))"
+            return 0
+        fi
+        sleep 0.5
+        i=$((i + 1))
+    done
+    echo "$name: FAILED to start (see $LOG_DIR/$name.log)" >&2
     return 1
 }
 
@@ -95,9 +134,56 @@ do_status_one() {
     pid="$(pid_of "$name")"
     if [ -n "$pid" ]; then
         echo "$name: running (pid $pid)"
+    elif [ -f "$RUN_DIR/$name.pid" ]; then
+        echo "$name: stopped (stale pidfile)"
     else
         echo "$name: stopped"
     fi
+}
+
+do_health() {
+    cd "$AGENT_ROOT" || return 1
+    FOREX_AGENT_HOME="$HOME_DIR" FOREX_AGENT_STORAGE="${FOREX_AGENT_STORAGE:-$HOME_DIR/storage/local.db}" \
+        "$PYTHON" -m daemon.supervisor health "$@"
+}
+
+do_safety() {
+    cd "$AGENT_ROOT" || return 1
+    FOREX_AGENT_HOME="$HOME_DIR" FOREX_AGENT_STORAGE="${FOREX_AGENT_STORAGE:-$HOME_DIR/storage/local.db}" \
+        "$PYTHON" -m daemon.supervisor safety "$@"
+}
+
+do_prune() {
+    cd "$AGENT_ROOT" || return 1
+    FOREX_AGENT_HOME="$HOME_DIR" FOREX_AGENT_STORAGE="${FOREX_AGENT_STORAGE:-$HOME_DIR/storage/local.db}" \
+        "$PYTHON" -m daemon.supervisor prune "$@"
+}
+
+do_logs() {
+    local lines=50 follow="" names=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --lines) lines="$2"; shift 2 ;;
+            --lines=*) lines="${1#--lines=}"; shift ;;
+            --follow|-f) follow=1; shift ;;
+            -*) echo "unknown option: $1" >&2; return 2 ;;
+            *) names="$names $1"; shift ;;
+        esac
+    done
+    [ -z "$names" ] && names="$DAEMONS"
+    local first=1
+    for d in $names; do
+        case " $DAEMONS " in *" $d "*) ;; *) echo "unknown daemon: $d" >&2; return 2 ;; esac
+        local log="$LOG_DIR/$d.log"
+        [ "$first" = 1 ] || echo
+        first=0
+        echo "== $d ($log) =="
+        if [ -f "$log" ]; then
+            if [ -n "$follow" ]; then tail -n "$lines" -f "$log"; else tail -n "$lines" "$log"; fi
+        else
+            echo "(no log file yet)"
+        fi
+    done
 }
 
 resolve_targets() {
@@ -115,19 +201,41 @@ resolve_targets() {
     echo "$out"
 }
 
-mkdir -p "$HOME_DIR/log"
-
 cmd="${1:-status}"
 shift || true
-targets="$(resolve_targets "$@")" || exit 2
 
 rc=0
 case "$cmd" in
-    start)   for d in $targets; do do_start_one "$d" || rc=1; done ;;
-    stop)    for d in $targets; do do_stop_one "$d" || rc=1; done ;;
-    restart) for d in $targets; do do_stop_one "$d"; done
-             for d in $targets; do do_start_one "$d" || rc=1; done ;;
-    status)  for d in $targets; do do_status_one "$d"; done ;;
-    *) echo "usage: $0 {start|stop|restart|status} [daemon...]" >&2; exit 2 ;;
+    start)
+        with_lock
+        targets="$(resolve_targets "$@")" || exit 2
+        for d in $targets; do do_start_one "$d" || rc=1; done ;;
+    stop)
+        with_lock
+        targets="$(resolve_targets "$@")" || exit 2
+        for d in $targets; do do_stop_one "$d" || rc=1; done ;;
+    restart)
+        with_lock
+        targets="$(resolve_targets "$@")" || exit 2
+        for d in $targets; do do_stop_one "$d"; done
+        for d in $targets; do do_start_one "$d" || rc=1; done
+        # Restart safety sequence: restore/verify state, reconcile,
+        # prune, and report health. Never trades.
+        echo "--- restart safety sequence ---"
+        do_safety || rc=1 ;;
+    status)
+        targets="$(resolve_targets "$@")" || exit 2
+        for d in $targets; do do_status_one "$d"; done ;;
+    health)
+        do_health "$@" || rc=1 ;;
+    safety)
+        with_lock
+        do_safety "$@" || rc=1 ;;
+    prune)
+        with_lock
+        do_prune "$@" || rc=1 ;;
+    logs)
+        do_logs "$@" || rc=1 ;;
+    *) echo "usage: $0 {start|stop|restart|status|health|safety|prune|logs} [daemon...]" >&2; exit 2 ;;
 esac
 exit "$rc"

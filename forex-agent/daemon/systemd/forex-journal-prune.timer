@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily forex-agent event-journal pruning
+Documentation=file:///opt/forex-agent/docs/OPERATIONS.md
+
+[Timer]
+# Pruning also runs on every `forex-daemons restart` (safety sequence);
+# the timer covers long-lived hosts that are rarely restarted.
+OnCalendar=daily
+RandomizedDelaySec=1800
+Persistent=true
+
+[Install]
+WantedBy=timers.target

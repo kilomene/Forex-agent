@@ -1,0 +1,17 @@
+[Unit]
+Description=Forex agent event-journal pruning (bounded retention)
+Documentation=file:///opt/forex-agent/docs/OPERATIONS.md
+
+[Service]
+Type=oneshot
+User=forex
+# Install location of the forex-agent tree (override with
+# systemctl edit if installed elsewhere).
+WorkingDirectory=/opt/forex-agent
+Environment=FOREX_AGENT_HOME=/var/lib/forex-agent
+Environment=FOREX_AGENT_STORAGE=/var/lib/forex-agent/storage/local.db
+# Bounded, config-driven pruning: keeps the last
+# events.journal_retention_days (default 30) / events.journal_max_events
+# (default 100000). Read-only with respect to trading state — the
+# kill-switch latch, idempotency keys, and risk state are never pruned.
+ExecStart=/usr/bin/python3 -m daemon.supervisor prune

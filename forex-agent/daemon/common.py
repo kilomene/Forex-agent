@@ -60,22 +60,56 @@ def read_pid(name: str) -> Optional[int]:
     return pid if _pid_alive(pid) else None
 
 
+def _await_owner(name: str, timeout: float = 1.0) -> Optional[int]:
+    """Poll for a pidfile owner that may still be writing its pid.
+
+    A process that just won the atomic create writes its pid within
+    microseconds; an empty/unparseable pidfile is given a short grace
+    period before being treated as stale (crashed mid-claim)."""
+    end = time.monotonic() + timeout
+    while True:
+        pid = read_pid(name)
+        if pid is not None:
+            return pid
+        if time.monotonic() >= end:
+            return None
+        time.sleep(0.02)
+
+
 def acquire_pidfile(name: str) -> bool:
     """Idempotent PID acquisition. Returns True if THIS process now owns
     the pidfile; False if another live process already does (caller
-    should exit quietly). Stale pidfiles are reclaimed."""
+    should exit quietly). Stale pidfiles are reclaimed.
+
+    The claim itself is atomic (O_CREAT|O_EXCL): N processes racing
+    acquire_pidfile() produce exactly one winner, so a duplicate daemon
+    can never start even if two supervisors fire at once.
+    """
     path = pid_file(name)
-    existing = read_pid(name)
-    if existing is not None:
+    if read_pid(name) is not None:
         return False
-    with open(path, "w") as fh:
-        fh.write(str(os.getpid()))
-    # Lost a race? Whoever wrote last wins; re-read to be sure it's us.
     try:
-        with open(path) as fh:
-            return int(fh.read().strip()) == os.getpid()
-    except (OSError, ValueError):
-        return False
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        # Lost the create race, or a stale pidfile appeared between the
+        # liveness check and the claim. A fresh winner writes its pid
+        # immediately, so poll briefly before concluding the file is
+        # stale; a truly stale file is reclaimed and the claim retried.
+        if _await_owner(name) is not None:
+            return False
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            return False
+    with os.fdopen(fd, "w") as fh:
+        fh.write(str(os.getpid()))
+        fh.flush()
+        os.fsync(fd)
+    return True
 
 
 def release_pidfile(name: str) -> None:
