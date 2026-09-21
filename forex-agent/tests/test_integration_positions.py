@@ -96,6 +96,16 @@ def test_modify_sl_tighten_ok():
     assert store.audits[-1]["kind"] == "modify_position"
 
 
+def test_modify_sl_loosen_rejected():
+    gw, store = _gateway()
+    broker = gw.adapter
+    r = gw.modify_position(111, stop_loss=1.0900)  # BUY sl 1.0950 -> looser
+    assert r["ok"] is False
+    assert r["error_code"] == "INVALID_ORDER"
+    assert "loosened" in r["message"]
+    assert broker.modified == []  # never reached the broker
+
+
 def test_modify_cannot_remove_sl():
     gw, _ = _gateway()
     r = gw.modify_position(111, stop_loss=0)

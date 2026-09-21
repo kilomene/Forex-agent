@@ -312,6 +312,8 @@ class ExecutionGateway:
                                        "stop_loss is mandatory and must stay positive")
         symbol = "unknown"
         broker_down = None
+        pos_direction = None
+        pos_sl = None
         try:
             open_positions = self.adapter.positions()
         except BrokerError as exc:
@@ -323,6 +325,8 @@ class ExecutionGateway:
         for pos in open_positions:
             if pos.ticket == ticket:
                 symbol = pos.symbol
+                pos_direction = pos.direction
+                pos_sl = pos.sl
                 if stop_loss is None:
                     stop_loss = pos.sl
                 if take_profit is None:
@@ -337,6 +341,15 @@ class ExecutionGateway:
         if stop_loss <= 0:
             return self._action_result(False, "INVALID_ORDER",
                                        "resulting stop_loss must stay positive (mandatory SL)")
+        if pos_sl and pos_sl > 0:
+            # Direction-aware tightening: a BUY stop may only move up, a
+            # SELL stop may only move down. Loosening is rejected.
+            if pos_direction == "BUY" and stop_loss < pos_sl:
+                return self._action_result(False, "INVALID_ORDER",
+                                           "stop_loss may be tightened but never loosened")
+            if pos_direction == "SELL" and stop_loss > pos_sl:
+                return self._action_result(False, "INVALID_ORDER",
+                                           "stop_loss may be tightened but never loosened")
         try:
             self.adapter.modify_order(ticket, stop_loss, take_profit)
         except BrokerError as exc:
