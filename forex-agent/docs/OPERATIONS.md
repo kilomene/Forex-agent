@@ -17,6 +17,71 @@ The subsystem is designed to run unattended. The normal state:
 
 Logs: `$FOREX_AGENT_HOME/log/<daemon>.log`. Events: `scripts/forex events`.
 
+## Lifecycle (start / stop / restart / status / health / logs)
+
+```bash
+./scripts/forex-daemons start            # start all four daemons
+./scripts/forex-daemons start health_monitor   # or one by name
+./scripts/forex-daemons stop             # stop all (SIGTERM, graceful; SIGKILL after 10s)
+./scripts/forex-daemons restart          # stop + start + restart safety sequence
+./scripts/forex-daemons status           # running (pid ...) / stopped / stopped (stale pidfile)
+./scripts/forex-daemons health [--json]  # aggregate: daemons + kill-switch latch +
+                                         # broker_status + event-journal tail + disk
+./scripts/forex-daemons safety [--json]  # run the restart safety sequence standalone
+./scripts/forex-daemons prune            # bounded event-journal pruning (see below)
+./scripts/forex-daemons logs [daemon] [--lines N] [--follow]
+```
+
+- **No duplicates, ever.** A lock serializes every mutating command, and
+  each daemon re-checks its PID file at startup — a second launcher
+  always loses and exits quietly. `start` on a running daemon is a
+  no-op. Stale PID files (dead process) are reclaimed automatically.
+- **Restart safety sequence** (runs at the end of every `restart`, or
+  via `safety`): 1) load local state — kill-switch latch, persisted
+  daemon states, idempotency store (read-only); 2) broker probe via
+  `broker_status()` — an unavailable broker is reported honestly, never
+  faked; 3) reconcile positions with `core.reconciliation` (reporting
+  only — it never trades; skipped honestly when the broker is down);
+  4) verify event state — journal intact, SSE `resume_from` stable
+  across the restart; 5) verify monitoring/notifications/MCP config;
+  6) prune the event journal; 7) report health. **The sequence never
+  submits, modifies, or closes a trade** — idempotency keys are only
+  read, and a pre-restart `request_id` is still recognized after the
+  restart (no double execution, guaranteed by the persisted
+  `execution_idempotency` table).
+- **Forex lifecycle ≠ agent lifecycle.** Daemons are launched detached
+  (`setsid` + `nohup`, own session), so they survive the exit of the
+  agent process that started them. Restarting the agent does NOT restart
+  the forex subsystem — use `forex-daemons restart` (or the systemd
+  target) for that.
+- **systemd vs scripts.** On hosts with systemd, enable the units in
+  `daemon/systemd/` (`forex-agent.target` + the four services; the prune
+  timer `forex-journal-prune.timer` for daily pruning). The unit
+  `ExecStart` lines run the exact same `python3 -m daemon.<name>`
+  commands as the script. Where systemd is absent (containers, macOS),
+  `scripts/forex-daemons` is the supported fallback supervisor — same
+  PID discipline, same commands.
+- **Kill switch survives restart.** The latch lives in the SQLite
+  `kill_switch` table; an engaged latch is still engaged after any
+  restart, and an unreadable latch fails closed (treated as engaged).
+
+## Event-journal pruning
+
+The push-event delivery journal (`event_journal`, the SSE replay log) is
+pruned boundedly so it cannot grow without limit:
+
+- `events.journal_retention_days` (default **30**) — drop events older
+  than N days. Env: `EVENTS_JOURNAL_RETENTION_DAYS`.
+- `events.journal_max_events` (default **100000**) — keep at most N
+  newest events. Env: `EVENTS_JOURNAL_MAX_EVENTS`.
+
+Set either to 0 to disable that bound. Pruning runs on every
+`forex-daemons restart` (safety sequence), on `forex-daemons prune`,
+and daily via the `forex-journal-prune.timer` systemd timer. Newest
+events are always kept, so SSE `resume_from` semantics are unaffected.
+The kill-switch latch, idempotency keys, risk state, and audit log are
+never pruned.
+
 ## Health checks
 
 ```bash
