@@ -122,32 +122,46 @@ def forex_request_trade(symbol: str, direction: str, volume: float,
 def forex_close_position(ticket) -> dict:
     """Close an open position by ticket.
 
-    HONEST UNAVAILABILITY: core.execution exposes no close API — the only
-    rule-compliant path for trade-affecting calls is the gateway, and the
-    gateway currently offers request_trade + kill-switch only (emergency
-    closes run through KillSwitch.close_all inside the health_monitor
-    daemon). The agent must NOT call adapter.close_position directly.
+    Routes through the execution gateway (never the adapter directly).
+    Closing is risk-reducing, so it is allowed even while the kill switch
+    is engaged. The gateway audit-logs the decision and emits
+    position.closed; the broker-confirmed close price is returned.
     """
-    return backend.err(
-        "DEPENDENCY_UNAVAILABLE",
-        "Position close is not exposed by core.execution.gateway yet "
-        "(request_trade + kill-switch only). Tracked for the execution "
-        "builder in agent/API_DEPS.md; the agent will not bypass the "
-        "gateway by calling the broker adapter directly.")
+    gateway, error = _gateway()
+    if error:
+        return error
+    try:
+        result = gateway.close_position(ticket, source="agent")
+    except Exception as exc:
+        logger.exception("gateway close_position raised")
+        return backend.err("GATEWAY_ERROR", "Execution gateway failed: %s" % exc)
+    return result
 
 
 def forex_modify_position(ticket, stop_loss: Optional[float] = None,
                           take_profit: Optional[float] = None) -> dict:
     """Modify SL/TP on an open position.
 
-    HONEST UNAVAILABILITY: same as forex_close_position — no gateway API
-    exists for modify; direct adapter calls are forbidden.
+    Routes through the execution gateway. The mandatory-SL rule is
+    enforced: an SL can be tightened but never removed. The gateway
+    audit-logs the decision and emits position.modified.
     """
-    return backend.err(
-        "DEPENDENCY_UNAVAILABLE",
-        "Position modify is not exposed by core.execution.gateway yet. "
-        "Tracked for the execution builder in agent/API_DEPS.md; the agent "
-        "will not bypass the gateway by calling the broker adapter directly.")
+    gateway, error = _gateway()
+    if error:
+        return error
+    try:
+        sl = float(stop_loss) if stop_loss is not None else None
+        tp = float(take_profit) if take_profit is not None else None
+    except (TypeError, ValueError):
+        return backend.err("INVALID_ARGUMENT",
+                           "stop_loss and take_profit must be numbers")
+    try:
+        result = gateway.modify_position(ticket, stop_loss=sl,
+                                         take_profit=tp, source="agent")
+    except Exception as exc:
+        logger.exception("gateway modify_position raised")
+        return backend.err("GATEWAY_ERROR", "Execution gateway failed: %s" % exc)
+    return result
 
 
 def forex_kill_switch(engage: bool = True, reason: Optional[str] = None) -> dict:

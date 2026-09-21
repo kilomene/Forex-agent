@@ -256,6 +256,113 @@ class ExecutionGateway:
                     req.direction, req.symbol, fill.volume, fill.ticket)
         return decision
 
+    # -- position management ------------------------------------------------
+    # Closes and SL/TP modifies also pass through the gateway (never direct
+    # adapter calls from agent/daemon/CLI). Closing is risk-reducing, so it
+    # is allowed even while the kill switch is engaged. Modifies must keep a
+    # mandatory stop-loss: an SL can be tightened but never removed.
+    def close_position(self, ticket, source: str = "agent") -> dict:
+        try:
+            ticket = int(ticket)
+        except (TypeError, ValueError):
+            return self._action_result(False, "INVALID_TICKET",
+                                       f"ticket must be an integer, got {ticket!r}")
+        symbol = "unknown"
+        try:
+            for pos in self.adapter.positions():
+                if pos.ticket == ticket:
+                    symbol = pos.symbol
+                    break
+        except Exception:
+            logger.debug("positions() lookup failed before close", exc_info=True)
+        try:
+            close_price = self.adapter.close_position(ticket)
+        except BrokerError as exc:
+            self._audit({"ts": _utcnow(), "kind": "close_position",
+                         "ticket": ticket, "symbol": symbol, "source": source,
+                         "approved": False, "reason": exc.message,
+                         "reason_code": exc.code})
+            return self._action_result(False, exc.code,
+                                       f"Broker refused close of ticket {ticket}: {exc.message}")
+        self._audit({"ts": _utcnow(), "kind": "close_position",
+                     "ticket": ticket, "symbol": symbol, "source": source,
+                     "approved": True, "reason": "broker-confirmed close",
+                     "close_price": close_price})
+        events_mod.emit({"event": "position.closed", "ticket": ticket,
+                         "symbol": symbol, "reason": f"closed via gateway by {source}",
+                         "close_price": close_price})
+        logger.info("Position closed: ticket=%s %s @ %s", ticket, symbol, close_price)
+        return self._action_result(True, "", "broker-confirmed close",
+                                   ticket=ticket, symbol=symbol,
+                                   close_price=close_price)
+
+    def modify_position(self, ticket, stop_loss=None, take_profit=None,
+                        source: str = "agent") -> dict:
+        try:
+            ticket = int(ticket)
+        except (TypeError, ValueError):
+            return self._action_result(False, "INVALID_TICKET",
+                                       f"ticket must be an integer, got {ticket!r}")
+        if stop_loss is None and take_profit is None:
+            return self._action_result(False, "INVALID_ORDER",
+                                       "nothing to modify: supply stop_loss and/or take_profit")
+        # Mandatory-SL rule: an SL can be moved but never removed.
+        if stop_loss is not None and stop_loss <= 0:
+            return self._action_result(False, "INVALID_ORDER",
+                                       "stop_loss is mandatory and must stay positive")
+        symbol = "unknown"
+        broker_down = None
+        try:
+            open_positions = self.adapter.positions()
+        except BrokerError as exc:
+            broker_down = exc
+            open_positions = []
+        except Exception:
+            logger.debug("positions() lookup failed before modify", exc_info=True)
+            open_positions = []
+        for pos in open_positions:
+            if pos.ticket == ticket:
+                symbol = pos.symbol
+                if stop_loss is None:
+                    stop_loss = pos.sl
+                if take_profit is None:
+                    take_profit = pos.tp
+                break
+        else:
+            if broker_down is not None:
+                return self._action_result(False, broker_down.code,
+                                           f"Cannot verify ticket {ticket}: {broker_down.message}")
+            return self._action_result(False, "INVALID_ORDER",
+                                       f"ticket {ticket} not found among open positions")
+        if stop_loss <= 0:
+            return self._action_result(False, "INVALID_ORDER",
+                                       "resulting stop_loss must stay positive (mandatory SL)")
+        try:
+            self.adapter.modify_order(ticket, stop_loss, take_profit)
+        except BrokerError as exc:
+            self._audit({"ts": _utcnow(), "kind": "modify_position",
+                         "ticket": ticket, "symbol": symbol, "source": source,
+                         "approved": False, "reason": exc.message,
+                         "reason_code": exc.code})
+            return self._action_result(False, exc.code,
+                                       f"Broker refused modify of ticket {ticket}: {exc.message}")
+        self._audit({"ts": _utcnow(), "kind": "modify_position",
+                     "ticket": ticket, "symbol": symbol, "source": source,
+                     "approved": True, "reason": "broker-confirmed modify",
+                     "stop_loss": stop_loss, "take_profit": take_profit})
+        events_mod.emit({"event": "position.modified", "ticket": ticket,
+                         "symbol": symbol, "stop_loss": stop_loss,
+                         "take_profit": take_profit})
+        logger.info("Position modified: ticket=%s SL=%s TP=%s", ticket, stop_loss, take_profit)
+        return self._action_result(True, "", "broker-confirmed modify",
+                                   ticket=ticket, symbol=symbol,
+                                   stop_loss=stop_loss, take_profit=take_profit)
+
+    def _action_result(self, ok: bool, code: str, message: str, **extra) -> dict:
+        result = {"ok": ok, "error_code": code, "message": message}
+        result.update(extra)
+        return result
+
     # -- helpers --------------------------------------------------------------
     def _safety_checks(self, req: TradeRequest, risk_inputs: dict) -> Optional[GatewayDecision]:
         # Market-open via tick freshness (the original
