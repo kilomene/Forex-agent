@@ -100,6 +100,12 @@ export async function setStatus(db, id, status, extra = {}) {
     fields.push('rejection_reason = ?');
     values.push(extra.rejection_reason);
   }
+  // Set by POST /signals/:id/failed — the bridge's MT5 order_send failure
+  // detail. Requires migration 0002 (adds failure_reason to signals).
+  if ('failure_reason' in extra) {
+    fields.push('failure_reason = ?');
+    values.push(extra.failure_reason);
+  }
 
   values.push(id);
   await db.prepare(`UPDATE signals SET ${fields.join(', ')} WHERE id = ?`).bind(...values).run();
@@ -184,32 +190,41 @@ export async function clearCloseAllRequest(db) {
   await setSetting(db, 'kill_switch_close_all_requested_at', '');
 }
 
-// --- Self-hosted AI model connection (app-configurable, not just a deploy-time secret) ---
-// Previously CUSTOM_AI_URL/CUSTOM_AI_API_KEY only existed as Worker
-// secrets, set once at deploy time via `wrangler secret put`. This lets
-// the app configure and change them at runtime — e.g. pointing at a
-// self-hosted model on an always-on VM — without redeploying the Worker.
-// When set, this takes precedence over the deploy-time env vars (see
-// agent/dynamicSettings.js) — clearing it here reverts to whatever
-// AI_PROVIDER/CUSTOM_AI_URL the Worker's own secrets specify.
+// --- API clients (per-client credentials) ---
+// Provisioned records created by scripts/provision-client.mjs. Secrets are
+// stored as SHA-256 hex digests only — never raw secrets. Revoked clients
+// are rejected by auth.js without distinguishing the failure reason.
 
-export async function getCustomAiSettings(db) {
-  const url = await getSetting(db, 'custom_ai_url', '');
-  const apiKey = await getSetting(db, 'custom_ai_api_key', '');
-  return { url: url || null, apiKey: apiKey || null };
+export async function getApiClient(db, clientId) {
+  return db
+    .prepare(`SELECT client_id, secret_hash, revoked, last_used_at FROM api_clients WHERE client_id = ?`)
+    .bind(clientId)
+    .first();
 }
 
-export async function setCustomAiUrl(db, url) {
-  await setSetting(db, 'custom_ai_url', url || '');
+export async function upsertApiClient(db, clientId, secretHash, label = null) {
+  const ts = now();
+  await db
+    .prepare(
+      `INSERT INTO api_clients (id, client_id, secret_hash, label, revoked, created_at)
+       VALUES (?, ?, ?, ?, 0, ?)
+       ON CONFLICT(client_id) DO UPDATE SET
+         secret_hash = excluded.secret_hash, label = excluded.label, revoked = 0`
+    )
+    .bind(newId(), clientId, secretHash, label, ts)
+    .run();
 }
 
-export async function setCustomAiApiKey(db, apiKey) {
-  await setSetting(db, 'custom_ai_api_key', apiKey || '');
+export async function revokeApiClient(db, clientId) {
+  await db.prepare(`UPDATE api_clients SET revoked = 1 WHERE client_id = ?`).bind(clientId).run();
 }
 
-export async function clearCustomAiSettings(db) {
-  await setSetting(db, 'custom_ai_url', '');
-  await setSetting(db, 'custom_ai_api_key', '');
+/** Best-effort usage stamp; callers must never fail a request on this. */
+export async function touchApiClient(db, clientId) {
+  await db
+    .prepare(`UPDATE api_clients SET last_used_at = ? WHERE client_id = ?`)
+    .bind(now(), clientId)
+    .run();
 }
 
 // --- Position close reporting (from exit_manager.py) ---

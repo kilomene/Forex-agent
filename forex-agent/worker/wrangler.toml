@@ -1,14 +1,39 @@
-name = "forex-signal-worker"
+# forex-agent cloud/sync layer — Cloudflare Worker deploy config.
+#
+# DEPLOY CHECKLIST (see worker/README.md):
+#   1. Set database_id below (DEPLOY-TIME placeholder — see below).
+#   2. Apply schema.sql to the D1 database (fresh) or migrations/*.sql (upgrade).
+#   3. Set secrets via `wrangler secret put <NAME>` (never in this file).
+#   4. Provision API clients: node scripts/provision-client.mjs <client_id>
+#      and register the printed SQL in D1 before pointing clients at this Worker.
+
+name = "forex-agent-worker"
 main = "src/index.js"
 compatibility_date = "2025-01-01"
 
 [[d1_databases]]
 binding = "DB"
 database_name = "forex-signals-db"
-database_id = "REPLACE_WITH_REAL_DATABASE_ID"  # set after `wrangler d1 create forex-signals-db`
+# >>> DEPLOY-TIME PLACEHOLDER — MUST BE SET BEFORE DEPLOY <<<
+# Get the real id from:  wrangler d1 create forex-signals-db
+# then replace the value below. The Worker cannot start without it
+# (the DB binding will be unbound and every request will 500).
+database_id = "REPLACE_WITH_REAL_DATABASE_ID"  # <-- SET THIS AT DEPLOY TIME
 
-# Secrets (set via `wrangler secret put <NAME>`, never in this file):
-#   WORKER_API_KEY        - shared bearer token the bridge and app both send
-#   ANTHROPIC_API_KEY      - for generating signal reasoning text
+# Non-secret tunables. Rate limits are enforced in-code (src/ratelimit.js),
+# per client, best-effort per isolate. For strict global limits, ALSO add a
+# Cloudflare dashboard rate-limiting rule on the Worker route.
+[vars]
+RATE_LIMIT_GENERAL_PER_MIN = "120"   # all routes, per client_id
+RATE_LIMIT_INGEST_PER_MIN = "30"      # POST /signals, per client_id
+RATE_LIMIT_AUTH_FAIL_PER_MIN = "20"   # failed auth attempts, per source IP
+
+# Secrets (set via `wrangler secret put <NAME>`, NEVER in this file):
 #   FCM_SERVICE_ACCOUNT_JSON - full Firebase service account JSON, as a single-line string
-#   FCM_PROJECT_ID          - Firebase project id (from the service account JSON)
+#   FCM_PROJECT_ID           - Firebase project id (from the service account JSON)
+#
+# REMOVED in this migration (do NOT set these — the Worker no longer reads them):
+#   WORKER_API_KEY    - old single shared secret; replaced by api_clients table
+#   ANTHROPIC_API_KEY - Worker performs no LLM calls anymore
+#   OPENROUTER_API_KEY / OPENROUTER_MODEL - same
+#   CUSTOM_AI_URL / CUSTOM_AI_API_KEY     - same

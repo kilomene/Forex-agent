@@ -14,6 +14,19 @@
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const SCOPE = 'https://www.googleapis.com/auth/firebase.messaging';
 
+// Module-level OAuth token cache. Tokens are good for 3600s; we reuse the
+// cached token until it is within REFRESH_SKEW_SEC of expiry, then mint a
+// fresh one. This replaces the original behavior of re-minting a token per
+// device per push. Cached per Worker isolate — safe: worst case an isolate
+// mints its own token once an hour.
+let cachedToken = null; // { access_token, expires_at_ms }
+const REFRESH_SKEW_SEC = 300;
+
+/** For tests only: clear the in-memory token cache. */
+export function __clearTokenCache() {
+  cachedToken = null;
+}
+
 function base64UrlEncode(bytes) {
   let binary = '';
   for (const b of new Uint8Array(bytes)) binary += String.fromCharCode(b);
@@ -35,7 +48,7 @@ function pemToArrayBuffer(pem) {
   return bytes.buffer;
 }
 
-async function getAccessToken(serviceAccount) {
+async function mintAccessToken(serviceAccount) {
   const header = { alg: 'RS256', typ: 'JWT' };
   const iat = Math.floor(Date.now() / 1000);
   const exp = iat + 3600;
@@ -82,7 +95,28 @@ async function getAccessToken(serviceAccount) {
   }
 
   const data = await resp.json();
-  return data.access_token;
+
+  // Return the token plus when it stops being usable, so callers can
+  // cache it and only re-mint near expiry. We don't trust the response's
+  // expires_in blindly — we still apply our own refresh skew.
+  const expiresInSec = Number(data.expires_in) || 3600;
+  return {
+    access_token: data.access_token,
+    expires_at_ms: Date.now() + expiresInSec * 1000,
+  };
+}
+
+/** Returns a valid access token, reusing the cached one until near-expiry. */
+async function getValidAccessToken(serviceAccount) {
+  if (
+    cachedToken &&
+    cachedToken.access_token &&
+    cachedToken.expires_at_ms - Date.now() > REFRESH_SKEW_SEC * 1000
+  ) {
+    return cachedToken.access_token;
+  }
+  cachedToken = await mintAccessToken(serviceAccount);
+  return cachedToken.access_token;
 }
 
 /**
@@ -93,7 +127,7 @@ async function getAccessToken(serviceAccount) {
 export async function sendPush(token, { title, body, data = {} }, env) {
   try {
     const serviceAccount = JSON.parse(env.FCM_SERVICE_ACCOUNT_JSON);
-    const accessToken = await getAccessToken(serviceAccount);
+    const accessToken = await getValidAccessToken(serviceAccount);
 
     const resp = await fetch(
       `https://fcm.googleapis.com/v1/projects/${env.FCM_PROJECT_ID}/messages:send`,
