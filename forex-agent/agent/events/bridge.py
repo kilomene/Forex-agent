@@ -15,6 +15,9 @@ this bridge: a small, persistent, vendor-neutral process that
     reset, daemon restart, ...),
   * resumes with ``resume_from=<cursor>`` so missed events replay in
     order after a restart,
+  * anchors a cursor-less ("live") subscription via GET /events/latest
+    before connecting, so an event journaled between bridge start and
+    the stream snapshot replays instead of being silently missed,
   * delivers each event AT-LEAST-ONCE to a host-provided sink,
     deduplicating on ``event_id``.
 
@@ -93,6 +96,13 @@ _BACKOFF_S = (1.0, 2.0, 4.0, 8.0, 15.0, 30.0, 60.0)
 _SSE_READ_TIMEOUT_S = 5.0
 # In-memory dedup window for redelivered frames (at-least-once overlap).
 _DEDUP_WINDOW = 2000
+# Delivery retry: a transiently failing sink must not tear down the
+# stream on the first rejection — retry in place a few times first.
+# (Tearing down immediately would lose the event: with no cursor yet,
+# the reconnect anchor would be the failed event itself and
+# resume_from is strictly-after, so it could never replay.)
+_DELIVERY_RETRIES = 10
+_DELIVERY_RETRY_S = 1.0
 
 
 class SinkError(Exception):
@@ -381,6 +391,11 @@ class Bridge:
         self._thread: Optional[threading.Thread] = None
         self._recent: Deque[str] = deque(maxlen=_DEDUP_WINDOW)
         self._cursor: Optional[str] = None
+        # Set once the bridge has established its first event-stream
+        # subscription with the server (anchor + HTTP 200). Tests wait
+        # on this before publishing: an event can only be guaranteed
+        # delivered once the server has snapshotted the stream.
+        self.subscribed = threading.Event()
 
     # -- lifecycle ------------------------------------------------------
 
@@ -425,9 +440,37 @@ class Bridge:
                 if self._stop.wait(wait):
                     return
 
+    def _fetch_latest_id(self) -> Optional[str]:
+        """Ask the server for its newest journaled event_id.
+
+        Used to anchor a cursor-less ("live") subscription: resume
+        strictly after this id so events journaled between bridge start
+        and the stream snapshot replay instead of being silently
+        missed. Raises on failure — the caller backs off and retries.
+        """
+        conn = http.client.HTTPConnection("127.0.0.1", self.port,
+                                          timeout=self.connect_timeout)
+        try:
+            conn.request("GET", "/events/latest?limit=1")
+            resp = conn.getresponse()
+            if resp.status != 200:
+                raise ConnectionError(
+                    "GET /events/latest -> HTTP %d" % resp.status)
+            body = json.loads(resp.read().decode("utf-8"))
+            last = body.get("last_event_id")
+            return last if isinstance(last, str) and last else None
+        finally:
+            conn.close()
+
     def _stream_once(self) -> None:
         """One SSE connection: replay missed, then stream live."""
         cursor = self._cursor
+        if cursor is None:
+            # No durable cursor: anchor "live" at first contact instead
+            # of letting the server snapshot whenever it gets around to
+            # it — otherwise an event journaled after we start but
+            # before the snapshot is silently missed.
+            cursor = self._fetch_latest_id()
         query = ("/events?resume_from=" + urllib.parse.quote(cursor)
                  if cursor else "/events")
         conn = http.client.HTTPConnection("127.0.0.1", self.port,
@@ -458,6 +501,7 @@ class Bridge:
             if "text/event-stream" not in ctype:
                 raise ConnectionError(
                     "expected text/event-stream, got %r" % ctype)
+            self.subscribed.set()
             self._pump(resp, conn)
         finally:
             conn.close()
@@ -508,17 +552,35 @@ class Bridge:
             # already saw this id — advance the cursor, don't redeliver.
             self._advance(event_id)
             return
-        try:
-            self.sink.deliver(event)
-        except Exception as exc:
-            # Sink did NOT accept it: keep the cursor where it is so the
-            # event replays on reconnect. Raise to trigger the backoff
-            # reconnect path (the stream will resume_from the old cursor).
-            logger.warning("bridge: sink rejected %s (%s); will retry",
-                           event_id, exc)
-            raise _DeliveryFailed(str(exc)) from exc
+        self._deliver_with_retry(event_id, event)
         self._recent.append(event_id)
         self._advance(event_id)
+
+    def _deliver_with_retry(self, event_id: str, event: dict) -> None:
+        """Deliver, retrying a rejecting sink in place before giving up.
+
+        A transient sink failure must not tear down the stream: with no
+        cursor yet, the reconnect anchor would be the failed event
+        itself and resume_from is strictly-after, so the event could
+        never replay. Raises _DeliveryFailed after _DELIVERY_RETRIES
+        attempts (the stream then reconnects and continues with newer
+        events; the rejection is logged). Raises _StreamEnd when
+        stop() is called mid-retry.
+        """
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, _DELIVERY_RETRIES + 1):
+            try:
+                self.sink.deliver(event)
+                return
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("bridge: sink rejected %s (%s); retry %d/%d",
+                               event_id, exc, attempt, _DELIVERY_RETRIES)
+                if self._stop.wait(_DELIVERY_RETRY_S):
+                    raise _StreamEnd()
+        raise _DeliveryFailed(
+            "sink rejected %s %d times: %s"
+            % (event_id, _DELIVERY_RETRIES, last_exc))
 
     def _advance(self, event_id: str) -> None:
         self._cursor = event_id
