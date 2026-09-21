@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+# Runtime data (created by installer/daemons — never commit)
+*.db
+*.db-journal
+install-state.json
+secrets.env
+*.pid
+# Node
+node_modules/
+# OS
+.DS_Store
