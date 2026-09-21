@@ -8,7 +8,8 @@ Runs every ``kill_switch.check_interval_seconds`` (default 10s) and:
   2. Cloud mirror check (best-effort): compare with the Worker's
      /kill-switch; a mismatch is logged as a warning — local wins,
      always. Worker outage never affects local safety.
-  3. Broker health: adapter.health() -> broker.connected event on change.
+  3. Broker health: adapter.broker_status() -> broker.connected /
+     broker.disconnected event on change (schema-valid payloads).
   4. Sibling daemons: market/signal/position monitor PIDs alive?
   5. Disk space: warn below 500 MB free in FOREX_AGENT_HOME.
   6. EVENT-QUEUE DRAIN: dequeue_events() -> worker_client.sync_events().
@@ -129,17 +130,39 @@ class HealthMonitor(Daemon):
 
     def _check_broker(self, config, state, status) -> None:
         checks = status["checks"]
+        # The structured broker_status() API is the honest health source:
+        # {"broker": {"provider", "configured", "reachable", "connected",
+        #             "account_available", ..., "detail"}}. It never raises.
         try:
             from agent.tools import backend  # noqa: PLC0415
-            health = backend.broker_health()
-            connected = bool(health.get("connected"))
+            adapter = backend.broker_adapter()
+            blob = adapter.broker_status()
+            broker = blob.get("broker") if isinstance(blob, dict) else None
+            broker = broker if isinstance(broker, dict) else {}
+            connected = bool(broker.get("connected"))
+            adapter_name = str(broker.get("provider")
+                               or getattr(adapter, "adapter_name", "unknown"))
+            detail = broker.get("detail")
+            detail = detail if isinstance(detail, dict) else {}
         except Exception as exc:
-            connected, health = False, {"error": str(exc)[:200]}
-        checks["broker"] = {"connected": connected}
+            connected, adapter_name = False, "unknown"
+            detail = {"reason": str(exc)[:200]}
+        checks["broker"] = {"connected": connected, "adapter": adapter_name}
         prev = state.get("broker_connected")
         if prev is not None and bool(prev) != connected:
-            event_bus.publish({"event": "broker.connected" if connected else "broker.disconnected",
-                  "note": "detected by health_monitor"})
+            # Bus schema: both events REQUIRE "adapter"; "broker.connected"
+            # takes no extra fields beyond account/server, while
+            # "broker.disconnected" accepts an optional "error".
+            if connected:
+                event_bus.publish({"event": "broker.connected",
+                                   "adapter": adapter_name})
+            else:
+                event_bus.publish({
+                    "event": "broker.disconnected",
+                    "adapter": adapter_name,
+                    "error": (detail.get("reason") or detail.get("probe_error")
+                              or "broker unreachable"),
+                })
             logger.warning("broker connection changed: %s -> %s", prev, connected)
         state["broker_connected"] = connected
         if not connected:
