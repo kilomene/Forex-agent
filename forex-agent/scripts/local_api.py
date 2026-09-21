@@ -316,6 +316,12 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.WARNING,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    # Single instance: a second API server always loses and exits quietly,
+    # so two processes can never fight over the port.
+    from daemon.common import acquire_pidfile  # noqa: PLC0415
+    if not acquire_pidfile("local_api"):
+        logger.warning("another local_api is already running; exiting")
+        return 0
     server = run(args.port)
     try:
         server.serve_forever()
