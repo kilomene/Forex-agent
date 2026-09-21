@@ -36,9 +36,12 @@ Then start the background daemons:
    symbols, timeframe, dry-run).
 5. Smoke-tests: manifest freshness check (`scripts/gen_manifest.py
    --check`), MCP ping, CLI config render.
-6. Optionally starts the four daemons (`--skip-daemons` to skip).
+6. Optionally starts the six managed services (four monitors plus the
+   `local_api` SSE/API server and the `agent_bridge` notification
+   bridge; `--skip-daemons` to skip).
 7. Probes the real state (`broker_status()`, config mode, kill-switch
-   latch, daemon supervisor) and writes the machine-readable result to
+   latch, daemon supervisor, plus a real TCP/`/health`/SSE-handshake
+   probe of the local API) and writes the machine-readable result to
    `$FOREX_AGENT_HOME/install-result.json` (printed on stdout with
    `--agent`/`--json`).
 8. With `--system` (as root): creates the `forex` user, installs systemd
@@ -73,7 +76,7 @@ Two files, two vocabularies — both always written:
   | `needs_credentials` | broker mode requested but `MT5_*` missing/blank | add them to `secrets.env` (0600), re-run — result carries a `required` list |
   | `error` | a step failed (`error.code`/`step`/`message`) | fix the named step, re-run |
 
-  Example (fresh install, no broker):
+  Example (fresh install, no broker, `--skip-daemons`):
 
   ```json
   {
@@ -86,12 +89,22 @@ Two files, two vocabularies — both always written:
     "broker_detail": "No broker configured (provider=disconnected).",
     "trading": "disabled",
     "signals": "available",
-    "events": "stopped",
+    "events": "unavailable",
+    "agent_notification": "unavailable",
     "mcp": "available",
     "daemons": false,
     "manifest": "/opt/forex-agent/agent/capabilities.json"
   }
   ```
+
+  `events` is `"running"` only when the installer **really probed**
+  `127.0.0.1:$FOREX_API_PORT` — TCP accept, `GET /health` → `ok:true`,
+  and an actual SSE handshake on `GET /events` — otherwise
+  `"unavailable"`. Daemon liveness alone never earns `"running"`.
+  `agent_notification` is `"configured"` (bridge running + a
+  `FOREX_AGENT_NOTIFICATION_COMMAND` sink is set), `"unconfigured"`
+  (bridge running, no sink — cursor tracked, nothing proactively
+  delivered), or `"unavailable"` (bridge not running).
 
 The installer is **idempotent**: re-running repairs and verifies instead of
 duplicating. The double-run proof lives in

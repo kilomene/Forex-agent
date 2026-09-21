@@ -15,10 +15,19 @@ truth) and verified with `scripts/gen_manifest.py --check`.
   - `cli`: `scripts/forex` with example invocations (`status --json`,
     `broker-status --json`, `events --since-id <id> --follow`, …).
   - `local_api`: `http://127.0.0.1:${FOREX_API_PORT:-8765}` with the real
-    GET/POST route list.
+    GET/POST route list (managed service `local_api`).
   - `events`: the SSE channel (`GET /events`, `Accept: text/event-stream`),
     `resume_from`/`ack` semantics, and the `GET /events/latest` poll
     fallback.
+- **Agent notification** — the persistent bridge
+  (`python3 -m agent.events.bridge`, managed service `agent_bridge`):
+  SSE → host-provided sink, durable cursor, reconnect backoff,
+  at-least-once delivery, the generic subprocess/stdin NDJSON sink
+  contract (`FOREX_AGENT_NOTIFICATION_COMMAND`), installer states, and
+  the honest guarantee boundary (Forex guarantees journaled/streamed/
+  bridged; it cannot guarantee the host model woke up).
+- **Services** — the managed services beyond the four monitors
+  (`local_api`, `agent_bridge`) with their commands.
 - **Lifecycle**: the real commands for install/start/stop/restart/
   status/health/logs, plus the status vocabulary the installer reports.
 - **Broker**: the fields of `broker_status()` and what each flag means
@@ -41,6 +50,7 @@ install result on stdout and always writes
   "trading": "disabled",
   "signals": "available",
   "events": "running",
+  "agent_notification": "unconfigured",
   "mcp": "available",
   "daemons": true,
   "manifest": "/opt/forex-agent/agent/capabilities.json"
@@ -48,7 +58,10 @@ install result on stdout and always writes
 ```
 
 `status` is derived from real probes (`broker_status()`, config mode,
-kill-switch state, daemon supervisor) — never invented. Missing or
+kill-switch state, daemon supervisor, and — for `events` — a real
+TCP/`/health`/SSE handshake probe of the local API) — never invented.
+`agent_notification` is `configured` / `unconfigured` / `unavailable`
+(see `docs/INSTALL.md`). Missing or
 empty/whitespace-only broker credentials yield
 `{"status": "needs_credentials", "required": ["MT5_LOGIN", ...]}`.
 

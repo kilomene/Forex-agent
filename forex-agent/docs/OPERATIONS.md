@@ -7,6 +7,8 @@ The subsystem is designed to run unattended. The normal state:
 ```bash
 ./scripts/forex-daemons status
 # market_monitor: running (pid ...) / signal_monitor: running ...
+# position_monitor: running ... / health_monitor: running ...
+# local_api: running (pid ...) / agent_bridge: running (pid ...)
 ```
 
 - `market_monitor` — feed watchdog (60s).
@@ -14,22 +16,26 @@ The subsystem is designed to run unattended. The normal state:
 - `position_monitor` — exit management on own positions (60s).
 - `health_monitor` — fail-closed kill-switch poll (10s), Worker sync,
   performance snapshot every 6h.
+- `local_api` — loopback HTTP API + SSE event stream
+  (`FOREX_API_PORT`, default 8765).
+- `agent_bridge` — notification bridge: SSE → host-agent sink,
+  durable cursor in `$FOREX_AGENT_HOME/run/agent-event.cursor`.
 
-Logs: `$FOREX_AGENT_HOME/log/<daemon>.log`. Events: `scripts/forex events`.
+Logs: `$FOREX_AGENT_HOME/log/<service>.log`. Events: `scripts/forex events`.
 
 ## Lifecycle (start / stop / restart / status / health / logs)
 
 ```bash
-./scripts/forex-daemons start            # start all four daemons
-./scripts/forex-daemons start health_monitor   # or one by name
+./scripts/forex-daemons start            # start all six services (4 monitors + local_api + agent_bridge)
+/scripts/forex-daemons start health_monitor   # or one by name
 ./scripts/forex-daemons stop             # stop all (SIGTERM, graceful; SIGKILL after 10s)
 ./scripts/forex-daemons restart          # stop + start + restart safety sequence
 ./scripts/forex-daemons status           # running (pid ...) / stopped / stopped (stale pidfile)
-./scripts/forex-daemons health [--json]  # aggregate: daemons + kill-switch latch +
+./scripts/forex-daemons health [--json]  # aggregate: services + kill-switch latch +
                                          # broker_status + event-journal tail + disk
 ./scripts/forex-daemons safety [--json]  # run the restart safety sequence standalone
 ./scripts/forex-daemons prune            # bounded event-journal pruning (see below)
-./scripts/forex-daemons logs [daemon] [--lines N] [--follow]
+./scripts/forex-daemons logs [name] [--lines N] [--follow]
 ```
 
 - **No duplicates, ever.** A lock serializes every mutating command, and
@@ -172,18 +178,25 @@ treats "broker down" as a normal operating state, not an incident:
 ## Local API server (SSE + HTTP)
 
 `scripts/local_api.py` is the only process serving `GET /events` (SSE),
-`/events/latest`, `/trade/request`, and the other HTTP routes. It is
-**not** supervised by `scripts/forex-daemons` or systemd — run it in the
-foreground (or under your own supervisor) on the same box:
+`/events/latest`, `/trade/request`, and the other HTTP routes. It runs
+as the managed service **`local_api`** — supervised by
+`scripts/forex-daemons` and by the `forex-local-api.service` systemd
+unit, part of `forex-agent.target`:
 
 ```bash
-python3 scripts/local_api.py                 # http://127.0.0.1:8765
-FOREX_API_PORT=9000 python3 scripts/local_api.py
+./scripts/forex-daemons status local_api
+./scripts/forex-daemons logs local_api
+FOREX_API_PORT=9000 ./scripts/forex-daemons restart local_api
 ```
 
-Binds 127.0.0.1 only — never expose the port beyond the host. If it is
-not running, the CLI and MCP interfaces still work fully (same
-capability surface); only the push stream and HTTP routes are absent.
+Binds 127.0.0.1 only — never expose the port beyond the host
+(`FOREX_API_PORT`, default 8765). Single-instance: a second server
+always loses and exits quietly, so two processes can never fight over
+the port. If it is not running, the CLI and MCP interfaces still work
+fully (same capability surface); only the push stream and HTTP routes
+are absent — and the installer reports `"events": "unavailable"` (it
+really probes TCP + `/health` + the SSE handshake before reporting
+`"running"`).
 
 ## Backups
 

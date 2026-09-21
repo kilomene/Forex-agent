@@ -182,6 +182,40 @@ daily-loss limit), `kill_switch.activated` (CRITICAL),
 `broker.disconnected` (CRITICAL), `health.check` (INFO). Full severity
 table and the poll fallback: `docs/EVENTS.md`.
 
+### Proactive delivery: the notification bridge (no polling needed)
+
+SSE alone does not guarantee you *receive* events — someone must
+subscribe. That someone is the **notification bridge**, a persistent
+managed service (`python3 -m agent.events.bridge`, supervised by
+`scripts/forex-daemons` as `agent_bridge` and by systemd as
+`forex-agent-bridge.service`). It tails `GET /events`, keeps a durable
+cursor (`$FOREX_AGENT_HOME/run/agent-event.cursor`), reconnects with
+backoff, resumes from the cursor, and delivers each event
+**at-least-once** to a host-provided sink. Delivery is at-least-once,
+not exactly-once: dedup on `event_id`.
+
+You provide the sink. The contract is `agent.events.bridge.AgentNotificationSink`
+(`deliver(event)` — raise when not accepted; `health()` — secret-free
+status). The generic shipped mechanism is **SubprocessSink**: set
+`FOREX_AGENT_NOTIFICATION_COMMAND` to a command line; the bridge parses
+it as argv (**never a shell**), validates the executable, spawns it,
+and streams one NDJSON envelope per line on its stdin:
+
+```json
+{"event_id": "evt_...", "event": "signal.detected", "severity": "NOTICE",
+ "timestamp": "...", "payload": {"symbol": "EURUSD", "direction": "BUY", ...}}
+```
+
+No vendor-specific code, no assumed host HTTP API (there is no
+`POST /agent/notify`). Without a sink command the bridge still runs and
+tracks its cursor (delivering nowhere) — the install result reports
+`agent_notification` as `configured` / `unconfigured` / `unavailable`
+honestly.
+
+**Guarantee boundary:** Forex guarantees event generated → journaled →
+streamable → bridge running. It can **not** guarantee "the host model
+woke up" — that depends on your sink integration.
+
 ## 6. Safety rules (non-negotiable)
 
 - **Dry-run is the default** (`mode: dry_run` in config). Live orders
@@ -212,18 +246,22 @@ table and the poll fallback: `docs/EVENTS.md`.
 ./scripts/forex-daemons {start|stop|restart|status|health|safety|prune|logs} [name...]
 ```
 
-Each daemon holds `$FOREX_AGENT_HOME/run/<name>.pid` and logs to
+Six managed services: the four monitors (`market_monitor`,
+`signal_monitor`, `position_monitor`, `health_monitor`) plus `local_api`
+(the loopback API + SSE server) and `agent_bridge` (the notification
+bridge). Each holds `$FOREX_AGENT_HOME/run/<name>.pid` and logs to
 `$FOREX_AGENT_HOME/log/<name>.log`. No duplicates ever: a lock
-serializes mutating commands and each daemon re-checks its PID file —
+serializes mutating commands and each service re-checks its PID file —
 a second launcher loses and exits quietly. Single-cycle runs for checks:
 
 ```bash
 python3 -m daemon.health_monitor --once
 ```
 
-systemd units live in `daemon/systemd/` (`forex-agent.target` + four
-services, user `forex`), plus `forex-journal-prune.timer` for daily
-event-journal pruning. The installer wires them with `--system` (root).
+systemd units live in `daemon/systemd/` (`forex-agent.target` + six
+services including `forex-local-api` and `forex-agent-bridge`, user
+`forex`), plus `forex-journal-prune.timer` for daily event-journal
+pruning. The installer wires them with `--system` (root).
 Full lifecycle semantics (restart safety sequence, journal pruning,
 kill-switch persistence): `docs/OPERATIONS.md`.
 

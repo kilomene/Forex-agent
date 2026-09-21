@@ -151,6 +151,43 @@ otherwise it is mapped from the event type:
    continues streaming live events. The client dedups on `event_id`
    (defensive; the journal never emits the same id twice).
 
+## The notification bridge (persistent subscriber)
+
+SSE is a pull stream: nothing is *pushed* to the host agent unless
+something subscribes. The shipped subscriber is
+`agent/events/bridge.py`, run as the managed `agent_bridge` service:
+
+- Subscribes to `GET /events` on 127.0.0.1 (loopback only; anything
+  else is refused).
+- Keeps a **durable cursor** — the last delivered `event_id` — in
+  `$FOREX_AGENT_HOME/run/agent-event.cursor` (atomic write). The
+  cursor advances only after the sink accepts the event.
+- **Reconnects with backoff** (1, 2, 4, 8, 15, 30, 60 s) across API
+  restarts, connection resets, and bridge restarts; resumes with
+  `resume_from=<cursor>` so missed events replay in order.
+- A cursor-less ("live") subscription is anchored via
+  `GET /events/latest` before connecting, so an event journaled
+  between bridge start and the stream snapshot replays instead of
+  being silently missed.
+- A stale cursor (unknown to the journal, e.g. rotated DB) gets HTTP
+  400: the bridge drops it and restarts live rather than failing
+  forever.
+- **Delivery is at-least-once**: the sink dedups on `event_id`;
+  exactly-once is not claimed. A rejecting sink is retried in place
+  before the stream is torn down.
+
+The host provides the sink via the `AgentNotificationSink` contract
+(`deliver(event)` / `health()`). The generic shipped sink is
+**SubprocessSink**: `FOREX_AGENT_NOTIFICATION_COMMAND` is parsed as
+argv (**never `shell=True`**), the executable is validated, and each
+event goes to the child's stdin as one NDJSON line:
+`{event_id, event, severity, timestamp, payload}`. With no sink
+command the bridge tracks its cursor but delivers nowhere.
+
+Guarantee boundary: Forex guarantees event generated → journaled →
+streamable → bridge running. It cannot guarantee "the host model woke
+up" — that depends on the host-provided sink.
+
 ## Where events come from
 
 Daemons (`signal_monitor`, `health_monitor`, `market_monitor`, …) and the
