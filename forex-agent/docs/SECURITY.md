@@ -3,10 +3,20 @@
 **Date:** 2026-09-21 · Scope: the whole subsystem (A: Linux forex-agent
 below) plus the Cloudflare Worker (B: cloud/sync layer).
 
-Note: the security reviewer's dated report
-(`docs/SECURITY_REVIEW_2026-09-21.md`) was not present when this
-document was last updated; Part A below is written from a direct audit
-of the code. If that report lands, fold its findings in here.
+**Dated security review:** `docs/SECURITY_REVIEW_2026-09-21.md` (2026-09-21,
+phase 8). It found and fixed 6 issues: (HIGH) `forex config --json`
+leaked a token-embedded `NOTIFY_WEBHOOK_URL` — `_redact` now masks
+`webhook` substrings and `login`/`server` keys; (MEDIUM)
+`AppConfig.redacted()` now covers all `SECRET_KEYS` including
+`MT5_LOGIN`/`MT5_SERVER`; (MEDIUM) bearer credentials
+(`MT5_GATEWAY_TOKEN`, `NOTIFY_WEBHOOK_URL`, `NEWS_CALENDAR_API_KEY`)
+added to the secrets contract and the installer's 0600 secrets file;
+(LOW) plain-HTTP gateway URLs now warn; (LOW) `/events` limits clamped
+to [1, 1000]; (LOW) installer/supervisor home dirs chmod 700. 16
+regression tests in `tests/test_security.py`. Residual accepted risks:
+account `login` shown on localhost-only operator surfaces; installer
+`sed` on operator-supplied paths; umask-inherited log DB perms. See the
+dated report for full detail.
 
 ---
 
