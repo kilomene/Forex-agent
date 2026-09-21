@@ -1,0 +1,45 @@
+name: EAS Build (Android)
+
+# Matches the established pattern from your other apps: Termux only ever
+# pushes to GitHub, every real build happens here in CI. This uses EAS
+# Build's cloud build service rather than a self-hosted Gradle build,
+# which is the standard path for apps using native modules like
+# expo-notifications' raw FCM token support (getDevicePushTokenAsync)
+# that Expo Go can't provide.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        # Same retry pattern used in the ZAO CI fix — registry hiccups on
+        # a fresh install shouldn't fail the whole workflow.
+        run: |
+          for i in 1 2 3; do
+            npm install --no-audit --no-fund && break
+            echo "npm install failed, retrying in 20s (attempt $i)"
+            sleep 20
+          done
+
+      - name: Type-check
+        run: npx tsc --noEmit
+
+      - name: Setup EAS
+        uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Build Android (EAS cloud build)
+        run: eas build --platform android --profile production --non-interactive

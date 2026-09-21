@@ -1,0 +1,10 @@
+node_modules/
+.expo/
+dist/
+web-build/
+google-services.json
+*.p8
+*.p12
+*.key
+*.mobileprovision
+.env

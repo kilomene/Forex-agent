@@ -1,0 +1,35 @@
+{
+  "expo": {
+    "name": "ALPHA",
+    "slug": "alpha",
+    "scheme": "alpha",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0F1419",
+    "newArchEnabled": true,
+    "android": {
+      "package": "com.segz7448.alpha",
+      "adaptiveIcon": {
+        "backgroundColor": "#0F1419"
+      },
+      "permissions": ["NOTIFICATIONS"],
+      "googleServicesFile": "./google-services.json"
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/notification-icon.png",
+          "color": "#4FB89E"
+        }
+      ]
+    ],
+    "extra": {
+      "router": {
+        "origin": false
+      }
+    }
+  }
+}
