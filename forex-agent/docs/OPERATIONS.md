@@ -139,6 +139,52 @@ are counted as skipped locally.
 If the cloud kill-switch mirror disagrees with the local latch, a warning
 is logged — **local always wins**.
 
+### Worker-down behavior (local safety survives)
+
+A dead, unreachable, or contract-mismatched Worker changes nothing
+locally: the kill-switch latch, risk state, execution gateway, and event
+journal are all local SQLite; daemons keep running; `request_trade`
+keeps enforcing risk + dry-run rules. The only degradation is that
+cloud sync stops and events accumulate in the local journal (bounded by
+the pruning policy) until sync resumes. Never treat `WORKER_UNAVAILABLE`
+as a trading-safety event.
+
+## Broker-down behavior
+
+The broker is the least reliable component by design, so the subsystem
+treats "broker down" as a normal operating state, not an incident:
+
+- `scripts/forex broker-status --json` shows exactly which capability
+  is missing (`connected: false` ≠ `trading_available: false` —
+  logged-in is not the same as allowed-to-trade).
+- `health_monitor` emits `broker.disconnected` (**CRITICAL**) into the
+  event journal on any transition.
+- Any broker-dependent tool call returns `BROKER_UNAVAILABLE` (or a
+  structured `{ok: false, error_code, ...}`) — never synthetic data.
+- Signal detection, journaling, events, notifications, config, and the
+  kill switch keep working. Positions already managed locally are
+  unaffected; the gateway refuses new submissions while the broker is
+  unreachable (they are `rejected`, auditable in the journal).
+- Recovery: fix the terminal/gateway, then `scripts/forex broker-status
+  --json` — no daemon restart is required. The restart safety sequence
+  also probes the broker and reports honestly when it is down.
+
+## Local API server (SSE + HTTP)
+
+`scripts/local_api.py` is the only process serving `GET /events` (SSE),
+`/events/latest`, `/trade/request`, and the other HTTP routes. It is
+**not** supervised by `scripts/forex-daemons` or systemd — run it in the
+foreground (or under your own supervisor) on the same box:
+
+```bash
+python3 scripts/local_api.py                 # http://127.0.0.1:8765
+FOREX_API_PORT=9000 python3 scripts/local_api.py
+```
+
+Binds 127.0.0.1 only — never expose the port beyond the host. If it is
+not running, the CLI and MCP interfaces still work fully (same
+capability surface); only the push stream and HTTP routes are absent.
+
 ## Backups
 
 The entire local state is one SQLite file:

@@ -1,8 +1,134 @@
-# SECURITY.md — forex-agent Worker (cloud/sync layer)
+# SECURITY.md — forex-agent
 
-**Date:** 2026-09-21 · Scope: the Cloudflare Worker only. Subsystem-side
-secret handling (env/`0600` files, never in code/logs) is covered in the
-top-level docs; the Worker side is specified here.
+**Date:** 2026-09-21 · Scope: the whole subsystem (A: Linux forex-agent
+below) plus the Cloudflare Worker (B: cloud/sync layer).
+
+Note: the security reviewer's dated report
+(`docs/SECURITY_REVIEW_2026-09-21.md`) was not present when this
+document was last updated; Part A below is written from a direct audit
+of the code. If that report lands, fold its findings in here.
+
+---
+
+# Part A — the forex-agent subsystem (Linux)
+
+## 1. Localhost-only API
+
+- `scripts/local_api.py` binds **127.0.0.1 only** — never `0.0.0.0`.
+  The loopback bind IS the access control; there is no auth on the API
+  or the SSE stream, by design.
+- **Never expose this port beyond the host.** Anyone who can reach it
+  can read events, account/positions data, and submit trade requests
+  (still gated by the execution gateway, §5–§7, but readable and
+  submittable).
+- `FOREX_API_PORT` (default 8765) only changes the port, never the
+  bind address.
+- The SSE stream holds one server thread per connection (stdlib
+  `ThreadingHTTPServer`) — sized for a handful of local agent
+  subscribers, not for many concurrent streams.
+
+## 2. Secret handling and redaction
+
+- Secrets live in **exactly two places**: environment variables, or
+  `$FOREX_AGENT_HOME/secrets.env` at **mode 0600**. The installer
+  creates it at 0600, never overwrites it on re-runs, never prints its
+  contents; `config/config.py` logs a warning if the file is readable
+  by group/other.
+- `AppConfig.redacted()` is the **only printable form** of the config.
+  `scripts/forex config --json` redacts secret fields; `scripts/forex
+  notify --status` masks `webhook_url`; webhook channel logs carry the
+  host only, never the full URL (the URL may embed a token).
+- Event payloads carry market/trade/risk facts — **never credentials**.
+  Nothing in the event journal, logs, or `install-result.json`
+  contains a secret.
+- The MT5 gateway bearer token (`MT5_GATEWAY_TOKEN`) is mandatory:
+  `RemoteMT5GatewayTransport` refuses to construct without it, so an
+  unauthenticated gateway connection cannot exist by accident.
+
+## 3. MT5 gateway: auth + allowlist
+
+- The remote MT5 gateway (`broker/mt5/gateway.py`) authenticates every
+  request with `Authorization: Bearer <MT5_GATEWAY_TOKEN>`. Missing
+  token → construction refused. Wrong token → `GATEWAY_AUTH_FAILED`;
+  unreachable host → `GATEWAY_UNREACHABLE`. All surface as structured
+  errors, never exceptions leaking the token.
+- The transport exposes exactly the 12 contracted operations in
+  `broker/mt5/gateway_contract.md` (`OPERATIONS` in `gateway.py`).
+  Any other operation name raises `GATEWAY_REJECTED` **before any
+  network I/O** — there is no "run arbitrary command" op, so a
+  compromised or confused caller cannot be talked into raw terminal
+  access.
+- `import MetaTrader5` occurs only under `broker/mt5/`; everything else
+  talks to `BrokerAdapter`.
+
+## 4. Input validation
+
+- The event bus (`agent/events/bus.py`) schema-validates every event
+  before journaling; malformed events are rejected, not stored.
+- Trade requests are validated in the gateway: symbol whitelist
+  (`INVALID_SYMBOL`), direction, volume step clamp, stop-loss/take-profit
+  presence and sanity, modify rules (stops may tighten only —
+  direction-aware: BUY stop up, SELL stop down), close requires a known
+  ticket.
+- SSE/HTTP: unknown `resume_from` / `ack` / `since` ids → HTTP 400
+  (`INVALID_ARGUMENT`), never silent misbehavior.
+- Installer: empty or whitespace-only `MT5_*` values count as missing →
+  `needs_credentials` with a `required` list, never a silent proceed.
+
+## 5. File permissions
+
+| Path | Permissions | Notes |
+|---|---|---|
+| `$FOREX_AGENT_HOME/secrets.env` | 0600 | never overwritten, never printed |
+| `$FOREX_AGENT_HOME/storage/local.db` | default umask of the installing user; keep the agent home private | holds kill-switch latch, risk state, idempotency keys, audit log |
+| `run/*.pid`, `log/*.log`, `run/notify.cursor` | agent home, same ownership | no secrets |
+
+For `--system` installs the `forex` user owns `/var/lib/forex-agent`;
+systemd unit `WorkingDirectory` must be readable only by that user.
+
+## 6. Kill-switch supremacy
+
+- The latch lives in local SQLite (`kill_switch` table), **persists
+  across restarts**, and is fail-closed: an unreadable latch is treated
+  as engaged.
+- It sits **below the agent layer**: natural-language instructions,
+  agent policy, Worker outage, and model output can never bypass it.
+  `health_monitor` re-checks the latch every 10 s and engages on any
+  read failure.
+- While engaged, the execution gateway rejects `request_trade` and
+  `modify_position`; `close_position` stays allowed because closing
+  reduces risk (blocking a close would trap the agent in a losing
+  position).
+- The Worker's kill-switch mirror is best-effort sync for the mobile
+  app; on any disagreement the **local latch always wins**.
+
+## 7. Dry-run default
+
+- `mode: dry_run` is the config default (`MODE` env / `agent.env`
+  overrides). In dry-run, the gateway's terminal lifecycle state is
+  `dry_run_simulated` — `executed` is reported only after real broker
+  confirmation.
+- Live trading requires a deliberate two-step act: `MODE=live` **and**
+  valid broker credentials. There is no casual path to live orders.
+- `core/execution/broker_guard.py`: any broker write outside the
+  gateway's `execution_scope()` raises
+  `BrokerError(GATEWAY_BYPASS_ATTEMPTED)`. Trading tools call the
+  gateway, never the adapter.
+
+## 8. Honest failure (what is never faked)
+
+No fake market data, no fake fills, no fake predictions. Disconnected
+or unreachable broker ⇒ `BROKER_UNAVAILABLE` with an explanatory
+message. Economic calendar and ML prediction report `available: false`.
+Real MT5 trading has not been validated in this environment (no
+terminal/credentials) — the docs say so wherever it matters.
+
+---
+
+# Part B — Cloudflare Worker (cloud/sync layer)
+
+Scope: the Worker only. Subsystem-side secret handling is covered in
+Part A above.
 
 ## 1. Authentication: per-client credentials
 
