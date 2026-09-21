@@ -149,6 +149,17 @@ Event schema: `{"event": "signal.detected", "ts", "symbol", "timeframe",
 | Key | Env | Default |
 |---|---|---|
 | `notifications.enabled` | `NOTIFICATIONS_ENABLED` | `false` |
+| `notifications.poll_interval_seconds` | `NOTIFY_POLL_INTERVAL_SECONDS` | `5.0` |
+| `notifications.timeout_seconds` | `NOTIFY_TIMEOUT_SECONDS` | `5.0` |
+| `notifications.max_attempts` | `NOTIFY_MAX_ATTEMPTS` | `2` |
+| `notifications.channels.agent/worker/fcm/webhook` | `NOTIFY_CHANNEL_*` | `true/true/false/false` |
+| `notifications.webhook_url` | `NOTIFY_WEBHOOK_URL` | `""` |
+| `notifications.fcm_project_id` | `FCM_PROJECT_ID` | `""` |
+| `notifications.fcm_push_path` | `NOTIFY_FCM_PUSH_PATH` | `""` |
+| `notifications.routing` | (yaml only) | severity → channels |
+
+Full architecture, per-channel setup, severity routing table, and
+failure semantics: [docs/NOTIFICATIONS.md](NOTIFICATIONS.md).
 
 Delivery is via the Worker (FCM) when `worker.enabled` is true; a local
 fallback may deliver without it. The mobile app is never required.

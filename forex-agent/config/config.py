@@ -235,11 +235,46 @@ class KillSwitchConfig:
 class EventsConfig:
     enabled: bool = field(default_factory=lambda: _bool("EVENTS_ENABLED", _y("events", "enabled", default=True)))
     queue_max: int = field(default_factory=lambda: _int("EVENTS_QUEUE_MAX", _y("events", "queue_max", default=1000)))
+    journal_retention_days: int = field(default_factory=lambda: _int(
+        "EVENTS_JOURNAL_RETENTION_DAYS", _y("events", "journal_retention_days", default=30)))
+    journal_max_events: int = field(default_factory=lambda: _int(
+        "EVENTS_JOURNAL_MAX_EVENTS", _y("events", "journal_max_events", default=100000)))
 
 
 @dataclass
 class NotificationsConfig:
     enabled: bool = field(default_factory=lambda: _bool("NOTIFICATIONS_ENABLED", _y("notifications", "enabled", default=False)))
+    poll_interval_seconds: float = field(default_factory=lambda: _float("NOTIFY_POLL_INTERVAL_SECONDS", _y("notifications", "poll_interval_seconds", default=5.0)))
+    timeout_seconds: float = field(default_factory=lambda: _float("NOTIFY_TIMEOUT_SECONDS", _y("notifications", "timeout_seconds", default=5.0)))
+    max_attempts: int = field(default_factory=lambda: _int("NOTIFY_MAX_ATTEMPTS", _y("notifications", "max_attempts", default=2)))
+    backoff_seconds: float = field(default_factory=lambda: _float("NOTIFY_BACKOFF_SECONDS", _y("notifications", "backoff_seconds", default=1.0)))
+    channel_agent: bool = field(default_factory=lambda: _bool("NOTIFY_CHANNEL_AGENT", _y("notifications", "channels", "agent", default=True)))
+    channel_worker: bool = field(default_factory=lambda: _bool("NOTIFY_CHANNEL_WORKER", _y("notifications", "channels", "worker", default=True)))
+    channel_fcm: bool = field(default_factory=lambda: _bool("NOTIFY_CHANNEL_FCM", _y("notifications", "channels", "fcm", default=False)))
+    channel_webhook: bool = field(default_factory=lambda: _bool("NOTIFY_CHANNEL_WEBHOOK", _y("notifications", "channels", "webhook", default=False)))
+    # Prefer the NOTIFY_WEBHOOK_URL env var — the URL may embed a token.
+    webhook_url: str = field(default_factory=lambda: _str("NOTIFY_WEBHOOK_URL", _y("notifications", "webhook_url", default="")))
+    fcm_project_id: str = field(default_factory=lambda: _str("FCM_PROJECT_ID", _y("notifications", "fcm_project_id", default="")))
+    # Worker push endpoint path for FCM ("" = none defined yet; the FCM
+    # channel then honestly reports unconfigured).
+    fcm_push_path: str = field(default_factory=lambda: _str("NOTIFY_FCM_PUSH_PATH", _y("notifications", "fcm_push_path", default="")))
+    routing: Dict[str, tuple] = field(default_factory=lambda: _notify_routing())
+
+
+def _notify_routing() -> Dict[str, tuple]:
+    """Severity -> channel-name routing, yaml-overridable.
+
+    Defaults mirror agent.notifications.dispatcher.DEFAULT_ROUTING (lazy
+    import keeps config.py free of the agent package at import time).
+    """
+    from agent.notifications.dispatcher import DEFAULT_ROUTING  # noqa: PLC0415
+    routing = {str(k).upper(): tuple(v) for k, v in DEFAULT_ROUTING.items()}
+    raw = _y("notifications", "routing", default=None)
+    if isinstance(raw, dict):
+        for sev, names in raw.items():
+            if isinstance(names, (list, tuple)):
+                routing[str(sev).upper()] = tuple(str(n) for n in names)
+    return routing
 
 
 @dataclass
@@ -330,7 +365,9 @@ class AppConfig:
 
         def _mask(obj: Any) -> Any:
             if isinstance(obj, dict):
-                return {k: ("***" if k in ("password", "api_key") else _mask(v))
+                # "webhook_url" may embed a token — never log it raw.
+                return {k: ("***" if k in ("password", "api_key", "webhook_url")
+                            else _mask(v))
                         for k, v in obj.items()}
             if isinstance(obj, list):
                 return [_mask(v) for v in obj]

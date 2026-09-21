@@ -226,6 +226,61 @@ def cmd_kill_switch(args) -> int:
                              {"engage": engage, "reason": args.reason}), args.json)
 
 
+# ---------------------------------------------------------------------------
+# notify — notification dispatcher control (Phase 6).
+#
+# Clearly separated from the rest of the CLI: this block owns the
+# `notify` subcommand only. The dispatcher itself lives in
+# agent/notifications/dispatcher.py and is also runnable as
+# `python3 -m agent.notifications.dispatcher`.
+# ---------------------------------------------------------------------------
+
+def cmd_notify(args) -> int:
+    """`forex notify`: --status (default) | --once [--since-id] | --run."""
+    from agent.notifications import dispatcher as notify  # noqa: PLC0415
+    from config.config import load_config  # noqa: PLC0415
+    try:
+        cfg = load_config()
+    except RuntimeError as exc:
+        return _out({"ok": False, "error_code": "CONFIG_INVALID",
+                     "message": str(exc)}, args.json)
+    disp = notify.build_dispatcher_from_config(cfg)
+
+    if getattr(args, "run", False) or getattr(args, "once", False):
+        if not cfg.notifications.enabled:
+            return _out({"ok": False, "error_code": "NOTIFICATIONS_DISABLED",
+                         "message": "set notifications.enabled=true "
+                                    "(NOTIFICATIONS_ENABLED=1) to run the "
+                                    "dispatcher"}, args.json)
+
+    if getattr(args, "run", False):
+        # Foreground loop; Ctrl-C / SIGTERM stops cleanly.
+        return notify.run_dispatcher(disp)
+
+    if getattr(args, "once", False):
+        since_id = getattr(args, "since_id", None)
+        if since_id:
+            try:
+                disp.seek(since_id)
+            except ValueError as exc:
+                return _out({"ok": False, "error_code": "INVALID_ARGUMENT",
+                             "message": str(exc)}, args.json)
+        try:
+            processed = disp.run_once()
+        except Exception as exc:  # noqa: BLE001 — CLI never tracebacks
+            return _out({"ok": False, "error_code": "INTERNAL_ERROR",
+                         "message": str(exc)}, args.json)
+        return _out({"ok": True, "processed": processed,
+                     "cursor": disp.cursor}, args.json)
+
+    # --status (default): channel configuration + health, secret-free.
+    return _out({"ok": True, "enabled": cfg.notifications.enabled,
+                 "channels": [ch.health() for ch in disp.channels.values()],
+                 "routing": {sev: list(names)
+                             for sev, names in disp.routing.items()}},
+                args.json)
+
+
 def build_parser() -> argparse.ArgumentParser:
     json_parent = argparse.ArgumentParser(add_help=False)
     json_parent.add_argument("--json", action="store_true",
@@ -289,6 +344,19 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--clear", action="store_true")
     p.add_argument("--reason", default=None)
     p.set_defaults(func=cmd_kill_switch)
+
+    # notify — notification dispatcher (Phase 6); see cmd_notify above.
+    p = sp("notify")
+    p.add_argument("--status", action="store_true",
+                   help="show channel configuration and health (default)")
+    p.add_argument("--once", action="store_true",
+                   help="process pending journal events once, then exit")
+    p.add_argument("--since-id", default=None,
+                   help="with --once: replay after this event_id instead of "
+                        "the saved cursor")
+    p.add_argument("--run", action="store_true",
+                   help="run the notification dispatcher loop (foreground)")
+    p.set_defaults(func=cmd_notify)
 
     return parser
 

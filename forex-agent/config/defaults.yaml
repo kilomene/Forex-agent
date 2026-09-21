@@ -90,7 +90,40 @@ events:
 
 notifications:
   enabled: false
-  # Delivery is via the Worker (FCM) when worker.enabled is true.
+  # Dispatcher loop: how often to check the delivery journal for new events.
+  poll_interval_seconds: 5.0
+  # HTTP timeout (seconds) for worker / fcm / webhook delivery.
+  timeout_seconds: 5.0
+  # Bounded retries for NOTIFICATION delivery only (2 attempts = 1 retry).
+  # The dispatcher never touches trade execution — there is no execution
+  # path here to retry.
+  max_attempts: 2
+  backoff_seconds: 1.0
+  # Per-channel enable flags. The agent channel (localhost SSE journal) is
+  # the PRIMARY path and is always available; the rest are optional sinks.
+  channels:
+    agent: true
+    worker: true
+    fcm: false
+    webhook: false
+  # Webhook POST target. Prefer the NOTIFY_WEBHOOK_URL env var — the URL
+  # may embed a token, and secrets never belong in yaml.
+  webhook_url: ""
+  # FCM (mobile push, worker-mediated, optional/legacy). Project id comes
+  # from the FCM_PROJECT_ID env var when set.
+  fcm_project_id: ""
+  # Worker push endpoint path for FCM, e.g. "/notify". Empty = the Worker
+  # contract defines no per-event push endpoint yet (see
+  # worker/CONTRACT.md), so the FCM channel honestly reports unconfigured
+  # until this is set.
+  fcm_push_path: ""
+  # Severity -> channels. CRITICAL reaches every configured channel;
+  # INFO stays on the agent channel only.
+  routing:
+    CRITICAL: [agent, worker, fcm, webhook]
+    WARNING: [agent, worker]
+    NOTICE: [agent, worker]
+    INFO: [agent]
 
 logging:
   level: INFO
