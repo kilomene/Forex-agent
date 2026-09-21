@@ -76,7 +76,7 @@ export MT5_LOGIN=12345 MT5_PASSWORD='...' MT5_SERVER='Broker-Server'
 # — or remote MT5 gateway host (see docs/ARCHITECTURE.md §9):
 export MT5_GATEWAY_URL='https://mt5-gateway.example.com' MT5_GATEWAY_TOKEN='...'
 export BROKER_PROVIDER=mt5
-export WORKER_ENABLED=true WORKER_BASE_URL='https://your-worker.workers.dev' WORKER_API_KEY='...'
+export WORKER_ENABLED=true WORKER_BASE_URL='https://forex-control-plane.ayiijumo.workers.dev' WORKER_API_KEY='...'
 ./installer/install.sh --agent --non-interactive --prefix ~/.forex-agent
 ```
 

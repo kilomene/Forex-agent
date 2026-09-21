@@ -6,7 +6,7 @@ checklist; the normative reference is [CONTRACT.md](CONTRACT.md).
 
 ## 1. Connection
 
-- `WORKER_BASE_URL`: e.g. `https://forex-agent-worker.<account>.workers.dev`
+- `WORKER_BASE_URL`: e.g. `https://forex-control-plane.ayiijumo.workers.dev`
   (no trailing slash). All paths below are relative to it.
 - Auth header on EVERY request (no exceptions, no unsigned health check):
   `Authorization: Basic base64(client_id:secret)` (preferred) or
