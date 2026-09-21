@@ -64,7 +64,7 @@ fi
 STATE_FILE="$PREFIX/install-state.json"
 SECRETS_FILE="$PREFIX/secrets.env"
 ENV_FILE="$PREFIX/agent.env"
-SECRET_KEYS="MT5_LOGIN MT5_PASSWORD MT5_SERVER WORKER_API_KEY"
+SECRET_KEYS="MT5_LOGIN MT5_PASSWORD MT5_SERVER MT5_GATEWAY_TOKEN WORKER_API_KEY NOTIFY_WEBHOOK_URL"
 
 log()  { echo "[install] $*"; }
 jsonq() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
@@ -243,6 +243,9 @@ esac
 # -- step: directories (idempotent) ----------------------------------------
 for d in "$PREFIX" "$PREFIX/run" "$PREFIX/log" "$PREFIX/storage"; do
     if [ ! -d "$d" ]; then mkdir -p "$d" && log "created $d"; fi
+    # The home tree holds secrets.env (0600) and the local DB: keep
+    # directory listings private too, not just the secret file itself.
+    chmod 700 "$d"
 done
 
 # -- step: secrets (never overwrite, always 0600) ---------------------------

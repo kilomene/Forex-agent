@@ -33,7 +33,18 @@ DEFAULTS_PATH = CONFIG_DIR / "defaults.yaml"
 # Keys that must never appear in logs / events / error strings.
 SECRET_KEYS = frozenset({
     "MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER", "MT5_TERMINAL_PATH",
+    "MT5_GATEWAY_TOKEN",
     "WORKER_API_KEY",
+    "NOTIFY_WEBHOOK_URL",
+    "NEWS_CALENDAR_API_KEY",
+})
+
+# Field names masked by AppConfig.redacted(). Mirrors SECRET_KEYS above
+# (mapped to dataclass field names) plus the webhook URL, which may
+# embed a token and must never be printed raw.
+REDACTED_FIELDS = frozenset({
+    "password", "api_key", "webhook_url",
+    "login", "server", "terminal_path",
 })
 
 
@@ -365,9 +376,10 @@ class AppConfig:
 
         def _mask(obj: Any) -> Any:
             if isinstance(obj, dict):
-                # "webhook_url" may embed a token — never log it raw.
-                return {k: ("***" if k in ("password", "api_key", "webhook_url")
-                            else _mask(v))
+                # Every secret field is masked — including broker login /
+                # server / terminal path (declared SECRET_KEYS) and the
+                # webhook URL (may embed a token).
+                return {k: ("***" if k in REDACTED_FIELDS else _mask(v))
                         for k, v in obj.items()}
             if isinstance(obj, list):
                 return [_mask(v) for v in obj]

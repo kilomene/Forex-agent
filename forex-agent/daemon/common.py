@@ -25,7 +25,13 @@ def get_home() -> str:
     if home:
         return home
     home = os.path.join(os.path.expanduser("~"), ".forex-agent")
-    os.makedirs(home, exist_ok=True)
+    # The home tree holds the secrets file and the local DB: restrict
+    # directory listings (mode applies only when the dir is created).
+    os.makedirs(home, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(home, 0o700)
+    except OSError:
+        pass
     return home
 
 

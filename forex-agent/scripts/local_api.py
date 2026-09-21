@@ -49,6 +49,14 @@ _SSE_POLL_INTERVAL_S = 1.0    # journal tail interval for new events
 _SSE_KEEPALIVE_S = 15.0       # idle comment interval to hold the connection
 _SSE_REPLAY_LIMIT = 1000      # max events replayed on resume_from connect
 
+# Cap on the JSON event-poll endpoints: a single localhost client must
+# not be able to pull an unbounded journal slice into memory.
+_EVENTS_LIMIT_MAX = 1000
+
+
+def _clamp_limit(query: dict) -> int:
+    return max(1, min(int(query.get("limit", ["50"])[0]), _EVENTS_LIMIT_MAX))
+
 
 def _json_response(handler: BaseHTTPRequestHandler, data: dict,
                    status: int = 200) -> None:
@@ -86,7 +94,7 @@ def _status_payload() -> dict:
 
 def _events_payload(query: dict) -> dict:
     from agent.events.bus import poll  # noqa: PLC0415
-    limit = int(query.get("limit", ["50"])[0])
+    limit = _clamp_limit(query)
     since = query.get("since", [None])[0]
     try:
         events = poll(limit=limit, since=since)
@@ -102,7 +110,7 @@ def _events_latest_payload(query: dict) -> dict:
     when ``since`` is absent. ValueError (unknown event_id / bad limit)
     is mapped to HTTP 400 by the GET dispatcher."""
     from agent.events import bus  # noqa: PLC0415
-    limit = int(query.get("limit", ["50"])[0])
+    limit = _clamp_limit(query)
     since = query.get("since", [None])[0]
     if since:
         events = bus.replay_after(since, limit=limit)

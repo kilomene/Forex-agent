@@ -199,6 +199,15 @@ class RemoteMT5GatewayTransport(MT5Transport):
                 f"Remote MT5 gateway requires a bearer token "
                 f"(set {GATEWAY_TOKEN_ENV}). Refusing unauthenticated gateway use.",
             )
+        if not url.lower().startswith("https://"):
+            # The bearer token rides in the Authorization header: over
+            # plain HTTP it is readable on the wire. Refusing would brick
+            # legitimate LAN/test setups, so warn loudly instead.
+            logger.warning(
+                "MT5 gateway URL %r does not use https:// — the bearer "
+                "token is sent in cleartext. Use https in production.",
+                url.split("@")[-1],
+            )
         self.base_url = url
         self._token = tok
         self.timeout = timeout
