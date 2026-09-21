@@ -1,0 +1,14 @@
+name = "forex-signal-worker"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "forex-signals-db"
+database_id = "REPLACE_WITH_REAL_DATABASE_ID"  # set after `wrangler d1 create forex-signals-db`
+
+# Secrets (set via `wrangler secret put <NAME>`, never in this file):
+#   WORKER_API_KEY        - shared bearer token the bridge and app both send
+#   ANTHROPIC_API_KEY      - for generating signal reasoning text
+#   FCM_SERVICE_ACCOUNT_JSON - full Firebase service account JSON, as a single-line string
+#   FCM_PROJECT_ID          - Firebase project id (from the service account JSON)
