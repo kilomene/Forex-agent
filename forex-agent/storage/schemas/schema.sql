@@ -65,3 +65,18 @@ CREATE TABLE IF NOT EXISTS event_journal (
 );
 CREATE INDEX IF NOT EXISTS idx_event_journal_event_id ON event_journal(event_id);
 CREATE INDEX IF NOT EXISTS idx_event_journal_ts ON event_journal(ts);
+
+-- Execution-gateway idempotency: every gateway request (request_trade,
+-- modify_position, close_position) carries a request_id (uuid). The first
+-- terminal decision/result is stored here; a repeated request_id returns
+-- the ORIGINAL record — no double execution, no double modify, no double
+-- close. request_id is globally unique (PRIMARY KEY); operation records
+-- which gateway op produced the decision. decision_json is the
+-- JSON-serialized GatewayDecision (request_trade) or result dict
+-- (modify/close). INSERT OR IGNORE: the first write wins, always.
+CREATE TABLE IF NOT EXISTS execution_idempotency (
+    request_id   TEXT PRIMARY KEY,   -- uuid hex, assigned per gateway request
+    operation    TEXT NOT NULL,      -- 'request_trade' | 'modify_position' | 'close_position'
+    decision_json TEXT NOT NULL,     -- JSON-encoded original decision/result
+    created_at   TEXT NOT NULL       -- UTC ISO-8601 of first decision
+);

@@ -16,6 +16,7 @@ Nothing in this module may import the broker package or MetaTrader5.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import uuid
 from typing import Optional
@@ -36,11 +37,40 @@ def _gateway():
         return None, backend.dep_unavailable("core.execution.gateway", exc)
 
 
+def _supports_request_id(fn) -> bool:
+    """True when a gateway method accepts the request_id kwarg.
+
+    Seam compatibility: older gateway doubles (e.g. the interface
+    fakes) predate request_id. We degrade to the legacy signature
+    rather than failing — never by retrying a call that may already
+    have executed.
+    """
+    try:
+        return "request_id" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _gateway_call(fn, *args, request_id=None, **kwargs):
+    """Call a gateway method, passing request_id only when supported."""
+    if request_id is not None and _supports_request_id(fn):
+        return fn(*args, request_id=request_id, **kwargs)
+    return fn(*args, **kwargs)
+
+
 def _decision_to_result(decision) -> dict:
-    """Map core.execution.gateway.GatewayDecision to a tool result."""
+    """Map core.execution.gateway.GatewayDecision to a tool result.
+
+    The result always carries the lifecycle ``state`` — "executed"
+    appears ONLY after broker confirmation; dry-run or unconfirmed
+    submissions report their true state (dry_run_simulated, rejected,
+    failed, ...), never executed.
+    """
     result = {
         "ok": bool(decision.approved),
         "idempotency_key": decision.idempotency_key,
+        "request_id": getattr(decision, "request_id", "") or "",
+        "state": getattr(decision, "state", "") or "",
         "volume": decision.volume,
     }
     if decision.approved:
@@ -65,14 +95,18 @@ def _decision_to_result(decision) -> dict:
 def forex_request_trade(symbol: str, direction: str, volume: float,
                         stop_loss: float, take_profit: Optional[float] = None,
                         signal_id: Optional[str] = None,
-                        idempotency_key: Optional[str] = None) -> dict:
+                        idempotency_key: Optional[str] = None,
+                        request_id: Optional[str] = None) -> dict:
     """Request a trade through the execution gateway. Returns its verdict.
 
     On approval the gateway has ALREADY submitted to the broker and the
-    result carries the broker-confirmed ticket/price. On rejection it
-    returns ok:false with a structured error_code (KILL_SWITCH_ENGAGED,
-    DRY_RUN_BLOCKED, RISK_LIMIT_EXCEEDED, INVALID_SYMBOL, ...). Trades
-    are never reported as executed before broker confirmation.
+    result carries the broker-confirmed ticket/price with state "executed".
+    On rejection it returns ok:false with a structured error_code
+    (KILL_SWITCH_ENGAGED, DRY_RUN_BLOCKED, RISK_LIMIT_EXCEEDED,
+    INVALID_SYMBOL, ...). Trades are never reported as executed before
+    broker confirmation: dry-run replays report state "dry_run_simulated".
+    ``request_id`` (uuid) is the idempotency identity: repeating a
+    request_id returns the ORIGINAL decision — never a second order.
     """
     gateway, error = _gateway()
     if error:
@@ -109,6 +143,7 @@ def forex_request_trade(symbol: str, direction: str, volume: float,
         take_profit=take_profit if take_profit is not None else 0.0,
         volume=volume,  # informational; the risk engine does the sizing
         idempotency_key=idempotency_key or uuid.uuid4().hex,
+        request_id=request_id or uuid.uuid4().hex,
         source="agent",
     )
     try:
@@ -119,19 +154,22 @@ def forex_request_trade(symbol: str, direction: str, volume: float,
     return _decision_to_result(decision)
 
 
-def forex_close_position(ticket) -> dict:
+def forex_close_position(ticket, request_id: Optional[str] = None) -> dict:
     """Close an open position by ticket.
 
     Routes through the execution gateway (never the adapter directly).
     Closing is risk-reducing, so it is allowed even while the kill switch
     is engaged. The gateway audit-logs the decision and emits
     position.closed; the broker-confirmed close price is returned.
+    ``request_id`` (uuid) is the idempotency identity: repeating a
+    request_id returns the ORIGINAL result — never a second close.
     """
     gateway, error = _gateway()
     if error:
         return error
     try:
-        result = gateway.close_position(ticket, source="agent")
+        result = _gateway_call(gateway.close_position, ticket, source="agent",
+                               request_id=request_id)
     except Exception as exc:
         logger.exception("gateway close_position raised")
         return backend.err("GATEWAY_ERROR", "Execution gateway failed: %s" % exc)
@@ -139,12 +177,16 @@ def forex_close_position(ticket) -> dict:
 
 
 def forex_modify_position(ticket, stop_loss: Optional[float] = None,
-                          take_profit: Optional[float] = None) -> dict:
+                          take_profit: Optional[float] = None,
+                          request_id: Optional[str] = None) -> dict:
     """Modify SL/TP on an open position.
 
     Routes through the execution gateway. The mandatory-SL rule is
-    enforced: an SL can be tightened but never removed. The gateway
-    audit-logs the decision and emits position.modified.
+    enforced: an SL can be tightened but never removed. Modifies are
+    blocked while the kill switch is engaged. The gateway audit-logs
+    the decision and emits position.modified. ``request_id`` (uuid) is
+    the idempotency identity: repeating a request_id returns the
+    ORIGINAL result — never a second modify.
     """
     gateway, error = _gateway()
     if error:
@@ -156,8 +198,9 @@ def forex_modify_position(ticket, stop_loss: Optional[float] = None,
         return backend.err("INVALID_ARGUMENT",
                            "stop_loss and take_profit must be numbers")
     try:
-        result = gateway.modify_position(ticket, stop_loss=sl,
-                                         take_profit=tp, source="agent")
+        result = _gateway_call(gateway.modify_position, ticket,
+                               stop_loss=sl, take_profit=tp, source="agent",
+                               request_id=request_id)
     except Exception as exc:
         logger.exception("gateway modify_position raised")
         return backend.err("GATEWAY_ERROR", "Execution gateway failed: %s" % exc)

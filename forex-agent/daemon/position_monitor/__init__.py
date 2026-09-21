@@ -35,6 +35,7 @@ class PositionMonitor(Daemon):
 
     def run_once(self) -> None:
         from core.positions import manage_open_positions  # noqa: PLC0415
+        from core.execution.broker_guard import execution_scope  # noqa: PLC0415
 
         config = load_config()
         adapter = get_adapter(config)
@@ -51,7 +52,14 @@ class PositionMonitor(Daemon):
             logger.warning("exit-manager closed signal %s: %s @ %s",
                            signal_id, reason, close_price)
 
-        stats = manage_open_positions(adapter, exits, timeframe, on_close=on_close)
+        # execution_scope: the standing exit policy (breakeven/trailing/
+        # time-based closes — risk-reducing by construction, the automated
+        # safety surface, not discretionary trading) is an allowed writer
+        # under the broker write-guard, alongside the execution gateway
+        # and the kill-switch sweep. Agent-initiated closes/modifies still
+        # go through the gateway (forex.close_position/forex.modify_position).
+        with execution_scope():
+            stats = manage_open_positions(adapter, exits, timeframe, on_close=on_close)
         if stats.get("closed") or stats.get("sl_tightened"):
             logger.warning("exit pass: %s", stats)
         else:

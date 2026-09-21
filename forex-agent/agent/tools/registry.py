@@ -164,24 +164,33 @@ CAPABILITIES: Dict[str, Dict[str, object]] = {
             "take_profit": {"type": "number"},
             "signal_id": {"type": "string"},
             "idempotency_key": {"type": "string"},
+            "request_id": {"type": "string"},
         }, ["symbol", "direction", "volume", "stop_loss"]),
         "func": forex_request_trade,
     },
     "forex.close_position": {
-        "description": "Close an open position by ticket. CURRENTLY UNAVAILABLE: "
-                       "core.execution.gateway exposes no close API yet; returns "
-                       "DEPENDENCY_UNAVAILABLE rather than bypassing the gateway.",
-        "input_schema": _schema({"ticket": {"type": "string"}}, ["ticket"]),
+        "description": "Close an open position by ticket through the execution "
+                       "gateway (audit-logged; broker-confirmed close price "
+                       "returned). Allowed even while the kill switch is "
+                       "engaged (closing reduces risk). Repeating a request_id "
+                       "returns the original result — never a second close.",
+        "input_schema": _schema({
+            "ticket": {"type": "string"},
+            "request_id": {"type": "string"},
+        }, ["ticket"]),
         "func": forex_close_position,
     },
     "forex.modify_position": {
-        "description": "Modify SL/TP on an open position. CURRENTLY UNAVAILABLE: "
-                       "core.execution.gateway exposes no modify API yet; returns "
-                       "DEPENDENCY_UNAVAILABLE rather than bypassing the gateway.",
+        "description": "Modify SL/TP on an open position through the execution "
+                       "gateway. Mandatory SL is enforced (tighten only, never "
+                       "loosen or remove). Blocked while the kill switch is "
+                       "engaged. Repeating a request_id returns the original "
+                       "result — never a second modify.",
         "input_schema": _schema({
             "ticket": {"type": "string"},
             "stop_loss": {"type": "number"},
             "take_profit": {"type": "number"},
+            "request_id": {"type": "string"},
         }, ["ticket"]),
         "func": forex_modify_position,
     },

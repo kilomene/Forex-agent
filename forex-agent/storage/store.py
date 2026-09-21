@@ -30,6 +30,7 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "schema.sql"
 DEFAULT_DB_PATH = Path(
@@ -346,3 +347,40 @@ class Store:
                 (event_id,),
             ).fetchone()
         return self._event_journal_entry(row) if row else None
+
+    # -- execution idempotency (gateway request_id dedup, survives restart) --
+    def idem_get(self, request_id: str) -> Optional[dict]:
+        """Return the stored idempotency record for request_id, or None.
+
+        Record shape: {"request_id", "operation", "decision" (dict),
+        "created_at"}. Used by the execution gateway; the first stored
+        decision for a request_id is the original — never overwritten.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT request_id, operation, decision_json, created_at "
+                "FROM execution_idempotency WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "request_id": row["request_id"],
+            "operation": row["operation"],
+            "decision": json.loads(row["decision_json"]),
+            "created_at": row["created_at"],
+        }
+
+    def idem_put(self, request_id: str, operation: str, decision: dict) -> None:
+        """Persist the original decision for request_id. INSERT OR IGNORE:
+        a repeated request_id keeps the FIRST decision, always."""
+        if not isinstance(decision, dict):
+            raise TypeError("idempotency decision must be a dict")
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO execution_idempotency"
+                "(request_id, operation, decision_json, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (request_id, operation, json.dumps(decision), _utcnow()),
+            )
+            self._conn.commit()
