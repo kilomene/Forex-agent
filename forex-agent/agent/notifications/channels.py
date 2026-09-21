@@ -29,6 +29,11 @@ Channels
   class docstring for exactly what is missing.
 * ``WebhookChannel`` (``webhook``) — POST the event JSON to a configured
   URL. Optional, timeout-bounded, failure-isolated.
+* ``TelegramChannel`` (``telegram``) — send a human-readable message to
+  a Telegram chat via a bot. Optional, timeout-bounded,
+  failure-isolated. Bot token comes from the ``TELEGRAM_BOT_TOKEN`` env
+  var only; the chat from ``TELEGRAM_CHAT_ID`` (env) or
+  ``notifications.telegram_chat_id``.
 
 Security: no secrets in code, logs, or health output. URLs are logged
 by host only; event payloads are never logged.
@@ -358,10 +363,118 @@ class WebhookChannel(NotificationChannel):
         return status
 
 
+# ---------------------------------------------------------------------------
+# TelegramChannel — Telegram bot messages (optional)
+# ---------------------------------------------------------------------------
+
+class TelegramChannel(NotificationChannel):
+    """Send event notifications to a Telegram chat via a bot. Optional.
+
+    The bot token comes from the ``TELEGRAM_BOT_TOKEN`` env var ONLY —
+    it is a secret and must never be written in yaml, code, or logs.
+    The target chat comes from ``TELEGRAM_CHAT_ID`` (env, preferred) or
+    ``notifications.telegram_chat_id`` in config.
+
+    Enable with ``notifications.channels.telegram: true`` (or
+    ``NOTIFY_CHANNEL_TELEGRAM=true``). Until the token AND chat id are
+    present, ``is_configured()`` is False and the dispatcher skips this
+    channel honestly — it never raises into the event path.
+
+    ``send()`` POSTs to
+    ``https://api.telegram.org/bot<TOKEN>/sendMessage``. ``signal.detected``
+    events are formatted as a human-readable trade signal (symbol,
+    direction, entry, SL, TP); every other event gets a one-line
+    ``[SEVERITY] event`` summary. Failures raise ``NotificationError``
+    and are isolated by the dispatcher — a dead Telegram never blocks
+    the agent channel or the event journal.
+    """
+
+    name = "telegram"
+    API_BASE = "https://api.telegram.org"
+
+    def __init__(self, enabled: bool = False, bot_token: str = "",
+                 chat_id: str = "", timeout: float = 5.0):
+        super().__init__(enabled=enabled)
+        self.bot_token = (bot_token or "").strip()
+        self.chat_id = (chat_id or "").strip()
+        self.timeout = max(0.5, float(timeout))
+
+    def is_configured(self) -> bool:
+        return self.enabled and bool(self.bot_token) and bool(self.chat_id)
+
+    def _format(self, event: dict) -> str:
+        # Plain text, no parse_mode: nothing to escape, no formatting bugs.
+        if event.get("event") == "signal.detected":
+            lines = [
+                "SIGNAL DETECTED",
+                "Symbol: %s %s" % (event.get("symbol", "?"),
+                                   event.get("timeframe", "")),
+                "Direction: %s" % (event.get("direction", "?"),),
+                "Entry: %s" % (event.get("entry_price", "?"),),
+                "SL: %s   TP: %s" % (event.get("stop_loss", "?"),
+                                     event.get("take_profit", "?")),
+                "Strategy: %s" % (event.get("strategy", "ema_rsi"),),
+            ]
+            trigger = event.get("trigger")
+            if trigger:
+                lines.append("Trigger: %s" % (trigger,))
+            return "\n".join(lines).strip()
+        return "[%s] %s" % (event.get("severity", "INFO"),
+                            event.get("event", "event"))
+
+    def send(self, event: dict) -> None:
+        if not self.is_configured():
+            raise NotificationError(
+                "telegram not configured: needs TELEGRAM_BOT_TOKEN + "
+                "TELEGRAM_CHAT_ID and channels.telegram enabled")
+        url = "%s/bot%s/sendMessage" % (self.API_BASE, self.bot_token)
+        payload = {"chat_id": self.chat_id, "text": self._format(event)}
+        try:
+            req = urllib.request.Request(
+                url, data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json",
+                         "User-Agent": "forex-agent-notify/1.0"},
+                method="POST")
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                status = resp.status
+                body = resp.read(4096)
+        except urllib.error.HTTPError as exc:
+            raise NotificationError(
+                "telegram sendMessage returned HTTP %s" % exc.code) from exc
+        except (urllib.error.URLError, socket.timeout, TimeoutError,
+                OSError) as exc:
+            # Includes connection timeouts/refused: isolated, never raised
+            # past the dispatcher.
+            raise NotificationError(
+                "telegram sendMessage POST failed: %s" % exc) from exc
+        if status >= 300:
+            raise NotificationError(
+                "telegram sendMessage returned HTTP %s" % status)
+        # Telegram answers {"ok": true, ...} — a 200 with ok=false means
+        # the message was NOT delivered (bad token, blocked bot, ...).
+        try:
+            ok = json.loads(body.decode("utf-8", "replace")).get("ok")
+        except Exception:
+            ok = None
+        if ok is not True:
+            raise NotificationError("telegram sendMessage answered ok=false")
+        # Log routing facts only — never the token, the URL, or the chat.
+        logger.info("notify telegram: delivered %s severity=%s",
+                    event.get("event_id"), event.get("severity"))
+
+    def health(self) -> Dict[str, Any]:
+        status = super().health()
+        # Secret-free: presence booleans only, never the token value.
+        status["token_set"] = bool(self.bot_token)
+        status["chat_id_set"] = bool(self.chat_id)
+        return status
+
+
 def channel(name: str, **kwargs: Any) -> NotificationChannel:
-    """Build a channel by name (``agent`` | ``worker`` | ``fcm`` | ``webhook``)."""
+    """Build a channel by name (``agent`` | ``worker`` | ``fcm`` | ``webhook`` | ``telegram``)."""
     registry = {"agent": AgentChannel, "worker": WorkerChannel,
-                "fcm": FCMChannel, "webhook": WebhookChannel}
+                "fcm": FCMChannel, "webhook": WebhookChannel,
+                "telegram": TelegramChannel}
     try:
         cls = registry[name]
     except KeyError:

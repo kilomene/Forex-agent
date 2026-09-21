@@ -43,7 +43,7 @@ SECRET_KEYS = frozenset({
 # (mapped to dataclass field names) plus the webhook URL, which may
 # embed a token and must never be printed raw.
 REDACTED_FIELDS = frozenset({
-    "password", "api_key", "webhook_url",
+    "password", "api_key", "webhook_url", "bot_token", "telegram_bot_token",
     "login", "server", "terminal_path",
 })
 
@@ -263,8 +263,12 @@ class NotificationsConfig:
     channel_worker: bool = field(default_factory=lambda: _bool("NOTIFY_CHANNEL_WORKER", _y("notifications", "channels", "worker", default=True)))
     channel_fcm: bool = field(default_factory=lambda: _bool("NOTIFY_CHANNEL_FCM", _y("notifications", "channels", "fcm", default=False)))
     channel_webhook: bool = field(default_factory=lambda: _bool("NOTIFY_CHANNEL_WEBHOOK", _y("notifications", "channels", "webhook", default=False)))
+    channel_telegram: bool = field(default_factory=lambda: _bool("NOTIFY_CHANNEL_TELEGRAM", _y("notifications", "channels", "telegram", default=False)))
     # Prefer the NOTIFY_WEBHOOK_URL env var — the URL may embed a token.
     webhook_url: str = field(default_factory=lambda: _str("NOTIFY_WEBHOOK_URL", _y("notifications", "webhook_url", default="")))
+    # Bot token is a secret: TELEGRAM_BOT_TOKEN env var ONLY, never yaml.
+    telegram_bot_token: str = field(default_factory=lambda: _str("TELEGRAM_BOT_TOKEN", ""))
+    telegram_chat_id: str = field(default_factory=lambda: _str("TELEGRAM_CHAT_ID", _y("notifications", "telegram_chat_id", default="")))
     fcm_project_id: str = field(default_factory=lambda: _str("FCM_PROJECT_ID", _y("notifications", "fcm_project_id", default="")))
     # Worker push endpoint path for FCM ("" = none defined yet; the FCM
     # channel then honestly reports unconfigured).

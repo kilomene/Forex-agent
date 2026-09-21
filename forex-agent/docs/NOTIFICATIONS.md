@@ -23,12 +23,12 @@ subsystems (daemons, gateway, risk, broker, ...)
 └─────────┬───────────┘
           │  send(event) — one channel failing never blocks the others
           ▼
- ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐
- │ agent  │  │ worker │  │  fcm   │  │webhook │
- │PRIMARY │  │optional│  │optional│  │optional│
- │always  │  │        │  │legacy  │  │
- │on      │  │        │  │        │  │
- └────────┘  └────────┘  └────────┘  └────────┘
+ ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐  ┌──────────┐
+ │ agent  │  │ worker │  │  fcm   │  │webhook │  │ telegram │
+ │PRIMARY │  │optional│  │optional│  │optional│  │ optional │
+ │always  │  │        │  │legacy  │  │        │  │          │
+ │on      │  │        │  │        │  │        │  │          │
+ └────────┘  └────────┘  └────────┘  └────────┘  └──────────┘
 ```
 
 The dispatcher **only reads** the journal and **only writes** to
@@ -44,6 +44,7 @@ action. (Retries: `max_attempts`, default 2 = one retry, small backoff.)
 | Worker | `worker` | `worker.enabled` + base URL | Forwards events to the Cloudflare Worker cloud/sync layer (`POST {base_url}/agent/events`, Bearer auth). **Best-effort:** `worker/CONTRACT.md` defines no agent-event sink yet — non-2xx/transport failures are logged and isolated. Coordinate with the Worker owner to add `POST /agent/events`. |
 | FCM | `fcm` | `fcm.enabled` + `FCM_PROJECT_ID` + Worker configured + `fcm_push_path` | **Optional, legacy, never required** for agent notification. Worker-mediated (the Worker owns the FCM token registry and `src/fcm.js`). Today the Worker contract only documents `POST /devices/test-push` (a manual test hook), so `fcm_push_path` defaults to empty and the channel honestly reports **unconfigured** until the Worker owner adds a per-event push endpoint. Direct FCM HTTP v1 from the agent is deliberately not implemented (would need google-auth JWT signing; not installed). |
 | Webhook | `webhook` | `webhook.enabled` + URL | POSTs the event JSON. URL from `NOTIFY_WEBHOOK_URL` (preferred — the URL may embed a token) or `notifications.webhook_url`. Timeout-bounded; failures isolated. Logs carry the host only, never the full URL. |
+| Telegram | `telegram` | `telegram` enabled + `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | Sends a human-readable message to a Telegram chat via a bot. Token from the `TELEGRAM_BOT_TOKEN` env var **only** (never in yaml — it is a secret); chat from `TELEGRAM_CHAT_ID` (env, preferred) or `notifications.telegram_chat_id`. `signal.detected` events arrive as a trade-signal card (symbol, direction, entry, SL, TP); other events as a one-line `[SEVERITY] event`. Setup: [TELEGRAM_SETUP.md](TELEGRAM_SETUP.md). |
 
 ## Severity routing
 
@@ -51,9 +52,9 @@ Default (`notifications.routing` in `config/defaults.yaml`, overridable):
 
 | Severity | Channels |
 |---|---|
-| CRITICAL | agent, worker, fcm, webhook |
-| WARNING | agent, worker |
-| NOTICE | agent, worker |
+| CRITICAL | agent, worker, fcm, webhook, telegram |
+| WARNING | agent, worker, telegram |
+| NOTICE | agent, worker, telegram |
 | INFO | agent |
 
 Unconfigured channels are **skipped** (logged at debug), never called.
@@ -91,7 +92,10 @@ Unknown severities fall back to `agent`.
 | `notifications.channels.worker` | `NOTIFY_CHANNEL_WORKER` | `true` |
 | `notifications.channels.fcm` | `NOTIFY_CHANNEL_FCM` | `false` |
 | `notifications.channels.webhook` | `NOTIFY_CHANNEL_WEBHOOK` | `false` |
+| `notifications.channels.telegram` | `NOTIFY_CHANNEL_TELEGRAM` | `false` |
 | `notifications.webhook_url` | `NOTIFY_WEBHOOK_URL` | `""` |
+| (bot token — env only) | `TELEGRAM_BOT_TOKEN` | `""` |
+| `notifications.telegram_chat_id` | `TELEGRAM_CHAT_ID` | `""` |
 | `notifications.fcm_project_id` | `FCM_PROJECT_ID` | `""` |
 | `notifications.fcm_push_path` | `NOTIFY_FCM_PUSH_PATH` | `""` |
 | `notifications.routing` | (yaml only) | see table above |

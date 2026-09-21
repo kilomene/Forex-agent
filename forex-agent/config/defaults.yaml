@@ -106,6 +106,11 @@ notifications:
     worker: true
     fcm: false
     webhook: false
+    telegram: false
+  # Telegram (optional). The bot token is a secret: it comes from the
+  # TELEGRAM_BOT_TOKEN env var ONLY and must never be written in yaml.
+  # Target chat: TELEGRAM_CHAT_ID env var (preferred) or telegram_chat_id.
+  telegram_chat_id: ""
   # Webhook POST target. Prefer the NOTIFY_WEBHOOK_URL env var — the URL
   # may embed a token, and secrets never belong in yaml.
   webhook_url: ""
@@ -120,9 +125,9 @@ notifications:
   # Severity -> channels. CRITICAL reaches every configured channel;
   # INFO stays on the agent channel only.
   routing:
-    CRITICAL: [agent, worker, fcm, webhook]
-    WARNING: [agent, worker]
-    NOTICE: [agent, worker]
+    CRITICAL: [agent, worker, fcm, webhook, telegram]
+    WARNING: [agent, worker, telegram]
+    NOTICE: [agent, worker, telegram]
     INFO: [agent]
 
 logging:
