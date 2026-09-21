@@ -24,8 +24,9 @@ ALLOWED_STATUSES = {"installed", "configured", "operational",
                     "needs_credentials", "error"}
 
 RESULT_KEYS = {"schema", "status", "prefix", "mode", "kill_switch_engaged",
-               "signals", "events", "mcp", "daemons", "manifest",
-               "broker", "broker_detail", "broker_provider", "trading"}
+               "signals", "events", "agent_notification", "mcp", "daemons",
+               "manifest", "broker", "broker_detail", "broker_provider",
+               "trading"}
 
 
 def clean_env(**overrides):
@@ -35,6 +36,7 @@ def clean_env(**overrides):
            "SYSTEMROOT": os.environ.get("SYSTEMROOT", "")}
     env = {k: v for k, v in env.items() if v}
     for key in ("FOREX_AGENT_HOME", "FOREX_AGENT_STORAGE", "FOREX_API_PORT",
+                "FOREX_AGENT_NOTIFICATION_COMMAND",
                 "BROKER_PROVIDER", "MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER",
                 "WORKER_API_KEY", "DRY_RUN", "MODE"):
         env.pop(key, None)
@@ -79,6 +81,12 @@ class TestInstallerAgentOutput(unittest.TestCase):
         self.assertEqual(result["schema"], "forex-agent.install-result/1")
         self.assertEqual(result["prefix"], self.prefix)
         self.assertEqual(result["mode"], "dry_run")
+        # --skip-daemons: no API/SSE server was started, so the honest
+        # states are unavailable — the installer must not claim events
+        # or notifications are running from daemon liveness alone.
+        self.assertEqual(result["events"], "unavailable")
+        self.assertEqual(result["agent_notification"], "unavailable")
+        self.assertFalse(result["daemons"])
         # install-result.json on disk matches what was printed.
         with open(os.path.join(self.prefix, "install-result.json")) as fh:
             on_disk = json.load(fh)
@@ -161,7 +169,26 @@ class TestInstallerAgentOutput(unittest.TestCase):
         self.assertNotEqual(result["broker"], "connected")
         self.assertTrue(result["broker_detail"],
                         "broker_detail must explain why, not just say down")
+        # Full install WITH services: the installer really probed
+        # 127.0.0.1:$FOREX_API_PORT (TCP + /health + SSE handshake), so
+        # "running" is earned, not inferred from daemon liveness.
         self.assertEqual(result["events"], "running")
+        # No host-agent sink command in this env: the bridge runs but
+        # delivers nowhere — reported honestly as unconfigured.
+        self.assertEqual(result["agent_notification"], "unconfigured")
+        self.assertTrue(result["daemons"])
+
+    def test_agent_notification_configured_with_sink_command(self):
+        # Full install WITH daemons and a host-agent sink command: the
+        # bridge runs and a sink is set -> "configured".
+        env = clean_env(FOREX_AGENT_NOTIFICATION_COMMAND="true",
+                        FOREX_AGENT_HOME=self.prefix)
+        proc = run_install(self.prefix, env, "--agent", timeout=300)
+        self.assertEqual(proc.returncode, 0,
+                         proc.stdout[-2000:] + proc.stderr[-2000:])
+        result = agent_result_from_stdout(proc)
+        self.assertEqual(result["events"], "running")
+        self.assertEqual(result["agent_notification"], "configured")
         self.assertTrue(result["daemons"])
 
     def test_error_shape(self):
