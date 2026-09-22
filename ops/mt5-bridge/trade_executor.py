@@ -30,7 +30,7 @@ State (under TRADER_STATE_DIR):
   trade_executor.state.json   signal cursor + seen ids + trades cursor +
                               open_map + cmd_index + applied config signature
   risk_config.json            risk config; created with SAFE defaults if missing;
-                              risk_per_trade_pct clamped to [0.25, 1.0];
+                              risk_per_trade_pct clamped to [0.05, 1.0];
                               max_concurrent_trades follows the repo
                               RiskPolicy (max_open_positions = 3) per owner
                               order 2026-09-21 -- values above 3 are clamped,
@@ -190,9 +190,10 @@ def audit_safety(run_dir, event, actor, details=None):
 # in the journal as config.changed. The one-position-per-symbol gate
 # remains in force as well.
 RISK_BOUNDS = {
-    # Floor lowered to 0.1 ($200 on the $200,000 basis) per owner order
-    # 2026-09-22 ~07:45 PDT. Ceiling stays 1.0.
-    "risk_per_trade_pct": (0.1, 1.0),
+    # Floor lowered to 0.05 ($100 on the $200,000 basis) per owner order
+    # 2026-09-22 ~09:15 PDT ("Spend 200k from the capital, $100 risk.
+    # Keep it that way"). Ceiling stays 1.0.
+    "risk_per_trade_pct": (0.05, 1.0),
 }
 
 

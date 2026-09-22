@@ -113,10 +113,10 @@ def test_risk_bounds_concurrent_clamped_to_owner_max():
 
 def test_risk_bounds_clamp_low():
     cfg, notes = te.apply_risk_bounds({
-        "risk_per_trade_pct": 0.05, "max_concurrent_trades": 0,
+        "risk_per_trade_pct": 0.01, "max_concurrent_trades": 0,
         "max_daily_loss_pct": 2.0, "max_spread_points": 50,
         "trading_enabled": True, "dry_run": False})
-    assert cfg["risk_per_trade_pct"] == 0.1
+    assert cfg["risk_per_trade_pct"] == 0.05
     assert cfg["max_concurrent_trades"] == te.DEFAULT_CONFIG["max_concurrent_trades"]
     assert len(notes) == 2
 
