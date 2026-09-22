@@ -190,7 +190,9 @@ def audit_safety(run_dir, event, actor, details=None):
 # in the journal as config.changed. The one-position-per-symbol gate
 # remains in force as well.
 RISK_BOUNDS = {
-    "risk_per_trade_pct": (0.25, 1.0),
+    # Floor lowered to 0.1 ($200 on the $200,000 basis) per owner order
+    # 2026-09-22 ~07:45 PDT. Ceiling stays 1.0.
+    "risk_per_trade_pct": (0.1, 1.0),
 }
 
 

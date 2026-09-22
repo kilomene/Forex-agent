@@ -116,7 +116,7 @@ def test_risk_bounds_clamp_low():
         "risk_per_trade_pct": 0.05, "max_concurrent_trades": 0,
         "max_daily_loss_pct": 2.0, "max_spread_points": 50,
         "trading_enabled": True, "dry_run": False})
-    assert cfg["risk_per_trade_pct"] == 0.25
+    assert cfg["risk_per_trade_pct"] == 0.1
     assert cfg["max_concurrent_trades"] == te.DEFAULT_CONFIG["max_concurrent_trades"]
     assert len(notes) == 2
 
