@@ -334,6 +334,17 @@ def test_end_to_end_real_data_privacy_clean(tmp_path):
     assert (out / "index.md").exists()
 
 
+def test_generate_empty_inputs_creates_index(tmp_path):
+    # Regression (CI 2026-09-22): with zero trades (no journal/broker/signal
+    # data, e.g. a fresh checkout in CI) generate() must still create the out
+    # dir and write index.md instead of raising FileNotFoundError, and the
+    # privacy gate must pass on the empty report.
+    out = tmp_path / "out"
+    result = rep.generate(str(out), [], [], [], {})
+    assert result["violations"] == []
+    assert (out / "index.md").exists()
+
+
 # --------------------------------------- QueryClose reconciliation contracts
 # 2026-09-22: the backfill pipeline writes confirmation_status="broker-confirmed"
 # (not a bare "confirmation" field) and supersedes provisional closes with

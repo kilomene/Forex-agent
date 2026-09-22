@@ -1055,6 +1055,11 @@ def generate(out_dir, journal, broker_trades, signals, positions):
                       pnl, reason, cls))
         print(f"  wrote {day}/{tr['ticket']}.md (+ .png) [{cls}]")
 
+    # The out dir must exist even when there are zero trades: per-day dirs are
+    # created inside the loop above, so with no trades nothing would create
+    # out_dir and write_index would raise FileNotFoundError. An empty input
+    # set is a legitimate state (e.g. a fresh checkout in CI), not an error.
+    os.makedirs(out_dir, exist_ok=True)
     write_index(out_dir, pages, positions)
     print(f"index: {out_dir}/index.md")
 
