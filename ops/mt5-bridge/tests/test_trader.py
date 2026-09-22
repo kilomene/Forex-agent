@@ -747,3 +747,73 @@ def test_audit_safety_writes(tmp_path):
     assert e["actor"] == "system"
     assert e["details"]["reason"] == "test"
     assert "time" in e
+
+
+# --------------------------------------------------------------- capital_basis
+# Owner order 2026-09-22: $200,000 allocated trading capital. Sizing and the
+# daily-loss gate run off the allocated basis instead of broker equity.
+
+def test_effective_risk_basis_uses_config_value():
+    assert te.effective_risk_basis({"capital_basis": 200000}, 1_258_148.44) == 200000
+
+
+def test_effective_risk_basis_clamped_to_account_equity():
+    # basis can never exceed what the account actually holds
+    assert te.effective_risk_basis({"capital_basis": 5_000_000}, 1_000_000) == 1_000_000
+
+
+def test_effective_risk_basis_zero_disables():
+    assert te.effective_risk_basis({"capital_basis": 0}, 1_000_000) == 0
+    assert te.effective_risk_basis({}, 1_000_000) == 0
+
+
+def test_effective_risk_basis_invalid_disables():
+    assert te.effective_risk_basis({"capital_basis": -100}, 1_000_000) == 0
+    assert te.effective_risk_basis({"capital_basis": "bogus"}, 1_000_000) == 0
+    assert te.effective_risk_basis(None, 1_000_000) == 0
+
+
+def test_apply_risk_bounds_capital_basis_validation():
+    cfg, notes = te.apply_risk_bounds({"capital_basis": -5})
+    assert cfg["capital_basis"] == 0
+    assert any("capital_basis" in n for n in notes)
+    cfg, notes = te.apply_risk_bounds({"capital_basis": "200000"})
+    assert cfg["capital_basis"] == 200000.0
+    assert notes == [] or not any("capital_basis" in n for n in notes)
+
+
+def test_gate_sizing_uses_capital_basis():
+    # 1% of $200,000 = $2,000 planned risk
+    d, flags = te.check_gates(sig(), **gate_ctx(risk_basis=200000.0))
+    assert d == "commanded"
+    assert flags["risk_amount"] == pytest.approx(2000.0)
+
+
+def test_gate_sizing_zero_basis_falls_back_to_equity():
+    # 1% of 1e6 equity = $10,000 (prior behavior preserved)
+    d, flags = te.check_gates(sig(), **gate_ctx(risk_basis=0))
+    assert d == "commanded"
+    assert flags["risk_amount"] == pytest.approx(10000.0)
+
+
+def test_gate_sizing_invalid_basis_falls_back_to_equity():
+    d, flags = te.check_gates(sig(), **gate_ctx(risk_basis="bogus"))
+    assert d == "commanded"
+    assert flags["risk_amount"] == pytest.approx(10000.0)
+    d, flags = te.check_gates(sig(), **gate_ctx(risk_basis=-500))
+    assert d == "commanded"
+    assert flags["risk_amount"] == pytest.approx(10000.0)
+
+
+def test_gate_daily_loss_limit_uses_capital_basis():
+    # live config: 3% of $200,000 = $6,000 daily-loss limit
+    d, flags = te.check_gates(
+        sig(), **gate_ctx(risk_basis=200000.0, max_daily_loss_pct=3.0,
+                          todays_profit=-6001.0))
+    assert d == "skipped:daily_loss_limit"
+    assert flags.get("trip") is True
+    # same loss on the full 1e6 equity would NOT trip (3% = $30,000)
+    d, _ = te.check_gates(
+        sig(), **gate_ctx(risk_basis=0, max_daily_loss_pct=3.0,
+                          todays_profit=-6001.0))
+    assert d == "commanded"

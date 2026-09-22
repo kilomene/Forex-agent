@@ -71,6 +71,11 @@ DEFAULT_CONFIG = {
     "max_consecutive_losses": 4,     # repo RiskPolicy: max_consecutive_losses
     "max_correlated_positions": 1,   # repo RiskPolicy: block_correlated_same_currency
     "require_stop_loss": True,       # repo RiskPolicy: require_stop_loss
+    "capital_basis": 0,              # owner order 2026-09-22: allocated trading
+                                   # capital in USD. 0 = disabled (risk sized
+                                   # off broker equity). When > 0, position
+                                   # sizing and the daily-loss gate use this
+                                   # basis instead of broker equity.
 }
 
 SPECS_MAX_AGE_S = 300
@@ -242,7 +247,39 @@ def apply_risk_bounds(cfg):
             f"max_spread_points {cfg.get('max_spread_points')} -> "
             f"{DEFAULT_CONFIG['max_spread_points']}")
         cfg["max_spread_points"] = DEFAULT_CONFIG["max_spread_points"]
+    # capital_basis: owner-allocated trading capital in USD (2026-09-22).
+    # 0/None = disabled (risk sized off broker equity). Must be a
+    # non-negative number; anything else falls back to disabled.
+    try:
+        cb = float(cfg.get("capital_basis") or 0)
+    except (TypeError, ValueError):
+        cb = -1.0
+    if cb < 0:
+        notes.append(
+            f"capital_basis {cfg.get('capital_basis')} -> 0 (disabled)")
+        cfg["capital_basis"] = 0
+    else:
+        cfg["capital_basis"] = cb
     return cfg, notes
+
+
+def effective_risk_basis(cfg, account_equity):
+    """Owner-allocated capital basis for risk sizing (pure function).
+
+    Returns the capital_basis from cfg, but never more than the account
+    actually holds. 0 means disabled: risk is sized off broker equity.
+    """
+    try:
+        cb = float((cfg or {}).get("capital_basis") or 0)
+    except (TypeError, ValueError):
+        cb = 0.0
+    if cb <= 0:
+        return 0
+    try:
+        eq = float(account_equity or 0)
+    except (TypeError, ValueError):
+        eq = 0.0
+    return min(cb, eq) if eq > 0 else cb
 
 
 def config_sig(cfg):
@@ -496,6 +533,7 @@ def check_gates(sig, *, enabled, dry_run, specs, specs_fresh,
                 open_positions, todays_profit, today_str,
                 risk_pct, max_concurrent, max_spread_points,
                 max_daily_loss_pct, equity, balance=None,
+                risk_basis=None,
                 max_total_exposure_lots=0, open_lots=0.0,
                 max_consecutive_losses=0, consecutive_losses=0,
                 max_correlated_positions=0, require_stop_loss=True,
@@ -504,10 +542,21 @@ def check_gates(sig, *, enabled, dry_run, specs, specs_fresh,
     Run the risk gates in order; first failure wins.
     Returns (decision, flags) where flags may carry loud/trip side effects.
     Pure function: no I/O.
+    risk_basis: owner-allocated capital (USD). When > 0 it replaces broker
+    equity for position sizing and the daily-loss gate. The
+    floating-drawdown gate keeps using real balance/equity.
     """
     symbol = sig.get("symbol")
     entry = sig.get("entry_price")
     sl = sig.get("stop_loss")
+
+    # Owner-allocated capital basis (2026-09-22): sizing and the daily-loss
+    # gate run off this instead of broker equity when set.
+    try:
+        rb = float(risk_basis) if risk_basis else 0.0
+    except (TypeError, ValueError):
+        rb = 0.0
+    sizing_equity = rb if rb > 0 else equity
 
     # 1. not enabled (config or kill switch)
     if not enabled:
@@ -522,7 +571,7 @@ def check_gates(sig, *, enabled, dry_run, specs, specs_fresh,
     spec = (specs.get("symbols") or {}).get(symbol) if specs else None
     if not specs_fresh or spec is None:
         return "skipped:stale_specs", {}
-    volume, risk_amount, err = compute_volume(equity, risk_pct, entry, sl, spec)
+    volume, risk_amount, err = compute_volume(sizing_equity, risk_pct, entry, sl, spec)
     if err:
         return err, {}
 
@@ -598,9 +647,9 @@ def check_gates(sig, *, enabled, dry_run, specs, specs_fresh,
     if spread is not None and spread > max_spread_points:
         return "skipped:spread_too_wide", {}
 
-    # 8. daily loss limit
+    # 8. daily loss limit (off the capital basis when one is set)
     daily_loss = 0.0 - todays_profit
-    if daily_loss >= (max_daily_loss_pct / 100.0) * equity:
+    if daily_loss >= (max_daily_loss_pct / 100.0) * sizing_equity:
         return "skipped:daily_loss_limit", {"loud": True, "trip": True}
 
     # 9. floating drawdown: total open loss (bot + manual positions) at or
@@ -826,6 +875,13 @@ class TraderEngine:
                open_positions, todays_profit, today_str, market_open=True,
                open_lots=0.0, consecutive_losses=0, tick_age_s=None):
         enabled = bool(cfg.get("trading_enabled")) and kill_on
+        account_equity = ((specs.get("account") or {}).get("equity") or 0) \
+            if specs else 0
+        account_balance = ((specs.get("account") or {}).get("balance") or 0) \
+            if specs else 0
+        # Owner order 2026-09-22: allocated trading capital. The basis can
+        # never exceed what the account actually holds.
+        risk_basis = effective_risk_basis(cfg, account_equity)
         decision, flags = check_gates(
             sig,
             enabled=enabled,
@@ -839,10 +895,9 @@ class TraderEngine:
             max_concurrent=cfg.get("max_concurrent_trades", 10),
             max_spread_points=cfg.get("max_spread_points", 50),
             max_daily_loss_pct=cfg.get("max_daily_loss_pct", 3.0),
-            equity=((specs.get("account") or {}).get("equity") or 0)
-                   if specs else 0,
-            balance=((specs.get("account") or {}).get("balance") or 0)
-                    if specs else 0,
+            equity=account_equity,
+            balance=account_balance,
+            risk_basis=risk_basis,
             max_total_exposure_lots=cfg.get("max_total_exposure_lots", 0),
             open_lots=open_lots,
             max_consecutive_losses=cfg.get("max_consecutive_losses", 0),
@@ -1093,7 +1148,8 @@ def main(argv):
         f"risk={cfg.get('risk_per_trade_pct')}% "
         f"max_concurrent={cfg.get('max_concurrent_trades')} "
         f"max_daily_loss={cfg.get('max_daily_loss_pct')}% "
-        f"max_spread={cfg.get('max_spread_points')}pts")
+        f"max_spread={cfg.get('max_spread_points')}pts "
+        f"capital_basis=${cfg.get('capital_basis', 0):,.0f}")
     if cfg.get("dry_run"):
         log("DRY RUN MODE: zero commands will be written; "
             "decisions journaled as 'intended'")
