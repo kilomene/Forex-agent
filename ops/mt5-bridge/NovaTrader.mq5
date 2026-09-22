@@ -45,6 +45,13 @@ string g_symbols[MAX_SYM];
 int    g_nsym      = 0;
 long   g_lastSpecs = 0;
 
+// Master symbol list from nova_symbols.txt (pre-select). After a terminal
+// restart the broker's Market Watch may not be synced yet, so SymbolSelect
+// can fail transiently at OnInit; EnsureSymbols() retries the missing ones
+// on every specs cycle so the specs file heals without a re-attach.
+string g_master[MAX_SYM];
+int    g_nmaster   = 0;
+
 //+------------------------------------------------------------------+
 //| Minimal JSON helpers (our files are one flat object per line)    |
 //+------------------------------------------------------------------+
@@ -505,6 +512,28 @@ void ProcessCommands()
 //+------------------------------------------------------------------+
 //| Symbol specs output                                              |
 //+------------------------------------------------------------------+
+// Retry SymbolSelect for master-list symbols missed at OnInit (post-restart
+// Market Watch sync race). Runs on the specs cycle; heals g_symbols live.
+void EnsureSymbols()
+{
+   int added = 0;
+   for(int k = 0; k < g_nmaster && g_nsym < MAX_SYM; k++)
+   {
+      string sym = g_master[k];
+      bool have = false;
+      for(int j = 0; j < g_nsym; j++)
+         if(g_symbols[j] == sym) { have = true; break; }
+      if(have) continue;
+      if(SymbolSelect(sym, true))
+      {
+         g_symbols[g_nsym++] = sym;
+         added++;
+      }
+   }
+   if(added > 0)
+      Print("NovaTrader: recovered ", added, " symbols post-restart, total=", g_nsym);
+}
+
 void WriteSpecs()
 {
    string syms = "";
@@ -573,16 +602,19 @@ int OnInit()
 
    string parts[];
    int total = LoadSymbolList(parts);
+   g_nmaster = 0;
    g_nsym = 0;
-   for(int k = 0; k < total && g_nsym < MAX_SYM; k++)
+   for(int k = 0; k < total && g_nmaster < MAX_SYM; k++)
    {
       string sym = parts[k];
       StringTrimLeft(sym);
       StringTrimRight(sym);
       if(StringLen(sym) == 0) continue;
+      g_master[g_nmaster++] = sym;   // remember every requested symbol
+      if(g_nsym >= MAX_SYM) continue;
       if(!SymbolSelect(sym, true))
       {
-         Print("NovaTrader: symbol not carried by broker, skipping: ", sym);
+         Print("NovaTrader: symbol not carried by broker (will retry): ", sym);
          continue;
       }
       g_symbols[g_nsym++] = sym;
@@ -598,7 +630,7 @@ int OnInit()
    g_lastSpecs = TimeGMT();
 
    Print("NovaTrader ready: magic=", InMagic, " timer=", InTimerSec,
-         "s specs=", InSpecsSec, "s symbols=", g_nsym);
+         "s specs=", InSpecsSec, "s symbols=", g_nsym, "/", g_nmaster);
    return(INIT_SUCCEEDED);
 }
 
@@ -615,6 +647,7 @@ void OnTimer()
    if(TimeGMT() - g_lastSpecs >= InSpecsSec)
    {
       g_lastSpecs = TimeGMT();
+      EnsureSymbols();
       WriteSpecs();
    }
 }
