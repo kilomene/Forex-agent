@@ -72,15 +72,22 @@ def feed_fresh():
 
 
 APT_CACHE = "/var/cache/apt/archives"
+# Persistent deb stash in the workspace. /var/cache/apt/archives is NOT
+# reliable: the platform's os-intent replay ends its pass with
+# `apt-get autoclean`, which purges cached debs after a reboot.
+WINE_DEB_DIR = os.path.join(HOME, "workspace", "mt5", "wine-debs")
 WINE_LIB = "/usr/lib/wine/wine64"
 WINE_LINK = "/usr/local/bin/wine64"
-# Proven 2026-09-22: after a host reboot the system layer loses wine64;
-# reinstall from the persistent apt archive cache with dpkg (no network,
-# no apt index needed), then recreate the /usr/local/bin symlink.
+# Proven 2026-09-22: after a host reboot the system layer loses wine64.
+# Reinstall order: workspace deb stash -> apt archive cache -> apt-get
+# install over the network (egress proxy). Then recreate the
+# /usr/local/bin symlink. xdotool rides along so the supervisor's GUI
+# re-attach path keeps working.
 WINE_DEBS = ["wine64_9.0~repack-4build3_amd64.deb",
              "wine_9.0~repack-4build3_all.deb",
              "libwine_9.0~repack-4build3_amd64.deb",
-             "fonts-wine_9.0~repack-4build3_all.deb"]
+             "fonts-wine_9.0~repack-4build3_all.deb",
+             "xdotool_3.20160805.1-5build1_amd64.deb"]
 WINE_DEP_GLOBS = ["libcapi20-3t64_*.deb", "libgphoto2-6t64_*.deb",
                   "libgphoto2-port12t64_*.deb",
                   "libgstreamer-plugins-base1.0-0_*.deb",
@@ -107,39 +114,50 @@ def dpkg_status(pkg):
 
 
 def ensure_wine():
-    """Reinstall Wine from the local apt cache if a reboot wiped it.
+    """Reinstall Wine after a reboot wiped it.
 
-    Returns True when a working wine64 is available afterwards.
-    Never raises.
+    Source order: workspace deb stash (persistent) -> apt archive cache
+    -> `apt-get install` over the network. Recreate the /usr/local/bin
+    symlink on success. Returns True when a working wine64 is available
+    afterwards. Never raises.
     """
     if wine_ok():
         return True
-    log("wine missing after reboot; reinstalling from apt cache")
+    log("wine missing after reboot; reinstalling")
     try:
         debs = []
-        for name in WINE_DEBS:
-            p = os.path.join(APT_CACHE, name)
-            if os.path.isfile(p):
-                debs.append(p)
-            else:
-                log("ensure_wine: cached deb not found: %s" % name)
-        for pattern in WINE_DEP_GLOBS:
-            hits = sorted(glob.glob(os.path.join(APT_CACHE, pattern)))
-            if hits:
-                debs.append(hits[0])
-        if not debs:
-            log("ensure_wine: no cached debs available")
-            return False
-        for round_no in range(3):
-            r = subprocess.run(
-                ["dpkg", "-i"] + debs, capture_output=True, text=True,
-                timeout=180)
-            r2 = subprocess.run(["dpkg", "--configure", "-a"],
-                                capture_output=True, text=True, timeout=180)
-            if dpkg_status("wine64") == "installed":
-                break
-            log("ensure_wine round %d: wine64 status=%s" %
-                (round_no, dpkg_status("wine64")))
+        for deb_dir in (WINE_DEB_DIR, APT_CACHE):
+            for name in WINE_DEBS:
+                p = os.path.join(deb_dir, name)
+                if os.path.isfile(p) and p not in debs:
+                    debs.append(p)
+                elif not os.path.isfile(p):
+                    log("ensure_wine: deb not in %s: %s" % (deb_dir, name))
+            for pattern in WINE_DEP_GLOBS:
+                hits = sorted(glob.glob(os.path.join(deb_dir, pattern)))
+                if hits and hits[0] not in debs:
+                    debs.append(hits[0])
+        if debs:
+            for round_no in range(3):
+                subprocess.run(
+                    ["dpkg", "-i"] + debs, capture_output=True, text=True,
+                    timeout=300)
+                subprocess.run(["dpkg", "--configure", "-a"],
+                               capture_output=True, text=True, timeout=180)
+                if dpkg_status("wine64") == "installed":
+                    break
+                log("ensure_wine round %d: wine64 status=%s" %
+                    (round_no, dpkg_status("wine64")))
+        else:
+            log("ensure_wine: no local debs available; trying apt-get")
+        if not wine_ok():
+            log("ensure_wine: falling back to apt-get install")
+            subprocess.run(
+                ["apt-get", "install", "-y", "--no-install-recommends",
+                 "wine64", "xdotool"],
+                capture_output=True, text=True, timeout=600)
+            subprocess.run(["dpkg", "--configure", "-a"],
+                           capture_output=True, text=True, timeout=180)
         try:
             if os.path.islink(WINE_LINK) or not os.path.exists(WINE_LINK):
                 if os.path.islink(WINE_LINK):
