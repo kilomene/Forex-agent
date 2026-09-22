@@ -72,6 +72,15 @@ DEFAULT_CONFIG = {
     "max_consecutive_losses": 4,     # repo RiskPolicy: max_consecutive_losses
     "max_correlated_positions": 1,   # repo RiskPolicy: block_correlated_same_currency
     "require_stop_loss": True,       # repo RiskPolicy: require_stop_loss
+    # Owner order 2026-09-22 ("nothing should be blocking you from
+    # trading"): the opportunity filters below are DISABLED. The executor
+    # still enforces the integrity/safety gates (kill switch, capital
+    # basis fail-closed, mandatory SL, fresh data, demo-only server,
+    # max concurrent, daily-loss limit, floating drawdown).
+    "enforce_correlation_gate": False,
+    "enforce_spread_gate": False,
+    "enforce_single_position_per_symbol": False,
+    "enforce_consecutive_losses_gate": False,
     "capital_basis": 0,              # owner order 2026-09-22: allocated trading
                                    # capital in USD. FAIL-CLOSED: must be a
                                    # finite positive number; anything else
@@ -631,7 +640,11 @@ def check_gates(sig, *, enabled, dry_run, specs, specs_fresh,
                 max_total_exposure_lots=0, open_lots=0.0,
                 max_consecutive_losses=0, consecutive_losses=0,
                 max_correlated_positions=0, require_stop_loss=True,
-                market_open=True, tick_age_s=None):
+                market_open=True, tick_age_s=None,
+                enforce_correlation_gate=True,
+                enforce_spread_gate=True,
+                enforce_single_position_per_symbol=True,
+                enforce_consecutive_losses_gate=True):
     """
     Run the risk gates in order; first failure wins.
     Returns (decision, flags) where flags may carry loud/trip side effects.
@@ -642,6 +655,10 @@ def check_gates(sig, *, enabled, dry_run, specs, specs_fresh,
     is then 'skipped:risk_basis_unavailable'. A valid basis replaces broker
     equity for position sizing and the daily-loss gate. The
     floating-drawdown gate keeps using real balance/equity.
+    The enforce_*_gate flags disable the opportunity filters (correlation,
+    spread, single-position-per-symbol, consecutive losses) while keeping
+    every integrity/safety gate active. Owner order 2026-09-22: all four
+    default OFF in live config so nothing blocks trading.
     """
     symbol = sig.get("symbol")
     entry = sig.get("entry_price")
@@ -716,10 +733,12 @@ def check_gates(sig, *, enabled, dry_run, specs, specs_fresh,
     if len(open_positions) >= max_concurrent:
         return "skipped:max_concurrent", {}
 
-    # 6. symbol already has an open position
-    for info in open_positions.values():
-        if info.get("symbol") == symbol:
-            return "skipped:symbol_already_open", {}
+    # 6. symbol already has an open position (opportunity filter --
+    #    disabled per owner order 2026-09-22)
+    if enforce_single_position_per_symbol:
+        for info in open_positions.values():
+            if info.get("symbol") == symbol:
+                return "skipped:symbol_already_open", {}
 
     # 6b. correlated positions: direction-aware net currency exposure.
     # A BUY is long base / short quote, a SELL the reverse. Two positions
@@ -728,7 +747,9 @@ def check_gates(sig, *, enabled, dry_run, specs, specs_fresh,
     # not block each other. Block only when the new signal would raise
     # net absolute exposure in a shared currency beyond the limit.
     # Unknown position direction fails closed (assumed to stack).
-    if max_correlated_positions and max_correlated_positions > 0:
+    # Opportunity filter -- disabled per owner order 2026-09-22.
+    if (enforce_correlation_gate and max_correlated_positions
+            and max_correlated_positions > 0):
         cand = signed_currency_exposure(symbol, sig.get("direction"))
         if not cand:
             # Unknown candidate direction: conservative count-based proxy.
@@ -758,17 +779,20 @@ def check_gates(sig, *, enabled, dry_run, specs, specs_fresh,
 
     # 6c. consecutive losses: after max_consecutive_losses straight
     # losing closes, no new entries until a winner resets the count.
-    if max_consecutive_losses and max_consecutive_losses > 0:
+    # Opportunity filter -- disabled per owner order 2026-09-22.
+    if (enforce_consecutive_losses_gate and max_consecutive_losses
+            and max_consecutive_losses > 0):
         if (consecutive_losses or 0) >= max_consecutive_losses:
             return "skipped:consecutive_losses", {"loud": True}
 
     # 7. spread too wide: fixed cap per the user's approved risk config
-    # (max_spread_points, default 50). Restored 2026-09-21: the earlier
-    # proportional loosening (max(50, 0.5 * SL distance)) was never
-    # approved and is removed; the EA enforces the same fixed cap at
-    # send time, so executor and EA now agree.
+    # (max_spread_points, default 50). Opportunity filter -- disabled per
+    # owner order 2026-09-22 ("nothing should be blocking you from
+    # trading"). NOTE: the NovaTrader EA enforces the same cap at send
+    # time via InMaxSpreadPoints; that input was raised to effectively
+    # unlimited in the same change so the EA does not re-block.
     spread = spec.get("spread_points")
-    if spread is not None and spread > max_spread_points:
+    if enforce_spread_gate and spread is not None and spread > max_spread_points:
         return "skipped:spread_too_wide", {}
 
     # 8. daily loss limit (off the capital basis when one is set)
@@ -1120,6 +1144,13 @@ class TraderEngine:
             require_stop_loss=bool(cfg.get("require_stop_loss", True)),
             market_open=market_open,
             tick_age_s=tick_age_s,
+            enforce_correlation_gate=bool(
+                cfg.get("enforce_correlation_gate", False)),
+            enforce_spread_gate=bool(cfg.get("enforce_spread_gate", False)),
+            enforce_single_position_per_symbol=bool(
+                cfg.get("enforce_single_position_per_symbol", False)),
+            enforce_consecutive_losses_gate=bool(
+                cfg.get("enforce_consecutive_losses_gate", False)),
         )
         return decision, flags
 

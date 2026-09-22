@@ -877,3 +877,84 @@ def test_gate_daily_loss_limit_uses_capital_basis():
         sig(), **gate_ctx(risk_basis=1_000_000.0, max_daily_loss_pct=3.0,
                           todays_profit=-6001.0))
     assert d == "commanded"
+
+
+# ------------------------------------------------------------------
+# Owner order 2026-09-22: opportunity filters disabled so nothing
+# blocks trading. The enforce_*_gate flags turn the correlation,
+# spread, single-position-per-symbol, and consecutive-losses gates off
+# while every integrity/safety gate stays live.
+# ------------------------------------------------------------------
+
+def _owner_ctx(**over):
+    """gate_ctx with all four opportunity filters disabled (live config)."""
+    ctx = gate_ctx(
+        enforce_correlation_gate=False,
+        enforce_spread_gate=False,
+        enforce_single_position_per_symbol=False,
+        enforce_consecutive_losses_gate=False,
+    )
+    ctx.update(over)
+    return ctx
+
+
+def test_disabled_correlation_gate_allows_stacking():
+    # EURUSD open; GBPUSD shares USD -> would block, now trades
+    pos = {111: {"symbol": "EURUSD", "command_id": "c1", "signal_id": "s1"}}
+    s = sig(symbol="GBPUSD")
+    ctx = _owner_ctx(open_positions=pos)
+    ctx["specs"] = {"symbols": {"GBPUSD": spec()},
+                    "account": {"server": "MetaQuotes-Demo",
+                                "equity": 1_000_000.0, "balance": 1_000_000.0}}
+    d, _ = te.check_gates(s, **ctx)
+    assert d == "commanded"
+
+
+def test_disabled_spread_gate_allows_wide_spread():
+    specs = {"symbols": {"XPDUSD": spec(spread_points=500)},
+             "account": {"server": "MetaQuotes-Demo", "equity": 1e6}}
+    d, _ = te.check_gates(sig(), **_owner_ctx(specs=specs))
+    assert d == "commanded"
+
+
+def test_disabled_single_position_gate_allows_double():
+    open_pos = {777: {"symbol": "XPDUSD", "command_id": "cmd-x"}}
+    d, _ = te.check_gates(sig(), **_owner_ctx(open_positions=open_pos))
+    assert d == "commanded"
+
+
+def test_disabled_consecutive_losses_gate_allows():
+    d, _ = te.check_gates(sig(), **_owner_ctx(consecutive_losses=9))
+    assert d == "commanded"
+
+
+def test_all_filters_disabled_worst_case_still_trades():
+    # correlated + wide spread + same symbol open + 9 straight losses
+    pos = {111: {"symbol": "EURUSD", "command_id": "c1", "signal_id": "s1"},
+           777: {"symbol": "GBPUSD", "command_id": "c2", "signal_id": "s2"}}
+    s = sig(symbol="GBPUSD")
+    specs = {"symbols": {"GBPUSD": spec(spread_points=500)},
+             "account": {"server": "MetaQuotes-Demo", "equity": 1e6,
+                        "balance": 1e6}}
+    ctx = _owner_ctx(open_positions=pos, specs=specs, consecutive_losses=9)
+    d, _ = te.check_gates(s, **ctx)
+    assert d == "commanded"
+
+
+def test_safety_gates_still_active_when_filters_disabled():
+    # kill switch still blocks
+    d, _ = te.check_gates(sig(), **_owner_ctx(enabled=False))
+    assert d == "skipped:trading_disabled"
+    # daily-loss limit still trips the kill switch
+    d, flags = te.check_gates(
+        sig(), **_owner_ctx(risk_basis=200000.0, max_daily_loss_pct=3.0,
+                           todays_profit=-6001.0))
+    assert d == "skipped:daily_loss_limit"
+    assert flags.get("trip") is True
+    # max concurrent still caps entries
+    pos = {i: {"symbol": f"S{i}", "command_id": "c"} for i in range(10)}
+    d, _ = te.check_gates(sig(), **_owner_ctx(open_positions=pos))
+    assert d == "skipped:max_concurrent"
+    # signals without a stop-loss are never traded
+    d, _ = te.check_gates(sig(stop_loss=None), **_owner_ctx())
+    assert d == "skipped:missing_sl_tp"

@@ -29,7 +29,9 @@
 
 input long   InMagic           = 20260921;
 input int    InSlippage        = 10;      // max deviation, points
-input int    InMaxSpreadPoints = 50;
+input int    InMaxSpreadPoints = 1000000; // owner order 2026-09-22:
+   // spread filter disabled ("nothing should be blocking you from
+   // trading"); input kept so the cap can be restored without recompile
 input int    InTimerSec        = 2;       // command poll interval
 input int    InSpecsSec        = 60;      // specs refresh interval
 input string InSymbols         = "EURUSD,GBPUSD,USDJPY,USDCHF,AUDUSD,USDCAD,NZDUSD,XAUUSD,XAGUSD,US30,US500";
