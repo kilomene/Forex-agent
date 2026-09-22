@@ -215,7 +215,18 @@ class TestMisc(BaseToolTest):
         result = tool("forex.get_session")()
         self.assertTrue(result["ok"])
         self.assertIn("active_sessions", result)
-        self.assertTrue(len(result["active_sessions"]) >= 1)
+        # Session coverage is time-dependent: during 22:00-00:00 UTC no
+        # major session is active, so active_sessions may legitimately be
+        # empty. Assert consistency with the canonical session windows
+        # (using the tool's own reported utc_hour, so no hour-boundary
+        # race) instead of assuming at least one session is active.
+        from intelligence.correlation.knowledge import SESSIONS_UTC
+        hour = result["utc_hour"]
+        expected = sorted(
+            name for name, w in SESSIONS_UTC.items()
+            if w["start"] <= hour < w["end"]
+        )
+        self.assertEqual(sorted(result["active_sessions"]), expected)
 
     def test_get_calendar_unconfigured(self):
         result = tool("forex.get_calendar")()
