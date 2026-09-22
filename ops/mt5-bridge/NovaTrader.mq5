@@ -287,9 +287,9 @@ void HandleTradeOpen(const string line)
       if(!(tp < price && price < sl)) { EmitRejected(commandId, "invalid_sl_tp"); return; }
    }
 
-   // Spread filter
-   double spreadPts = (tick.ask - tick.bid) / point;
-   if(spreadPts > InMaxSpreadPoints) { EmitRejected(commandId, "spread_too_wide"); return; }
+   // Spread filter: REMOVED per owner order 2026-09-22 ("nothing should be
+   // blocking you from trading"). InMaxSpreadPoints is kept as a vestigial
+   // input for profile compatibility but is no longer consulted.
 
    // Volume: clamp to [min,max], round DOWN to step
    double vmin  = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
