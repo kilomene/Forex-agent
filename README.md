@@ -4,7 +4,7 @@
 [![release](https://img.shields.io/github/v/release/kilomene/Forex-agent)](https://github.com/kilomene/Forex-agent/releases)
 ![python](https://img.shields.io/badge/python-3.12%2B-blue)
 ![platform](https://img.shields.io/badge/platform-linux-lightgrey)
-![license](https://img.shields.io/badge/license-MIT-green)
+![license](https://img.shields.io/badge/license-TBD-lightgrey)
 
 An **agent-native forex trading subsystem**: deterministic market analysis, signal detection, and a dry-run-by-default execution gateway that your AI agent can install, operate, and monitor — over MCP, a CLI, a local HTTP API, and Telegram.
 
@@ -213,4 +213,4 @@ Issues and pull requests are welcome. CI must stay green: run the test commands 
 
 ## License
 
-MIT — do what you want, at your own risk. Demo/research software; not financial advice.
+No license file is committed yet — add a `LICENSE` to set the terms (e.g. MIT, Apache-2.0). Demo/research software; not financial advice.
