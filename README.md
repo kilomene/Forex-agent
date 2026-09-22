@@ -17,21 +17,34 @@ An **agent-native forex trading subsystem**: deterministic market analysis, sign
 Copy-paste this to your agent:
 
 ```
-Install the Forex agent from https://github.com/kilomene/Forex-agent:
-clone the repo, run the installer non-interactively, verify the
-installation, and leave it in dry-run mode. Report the final
-install status and broker state.
+Install the Forex agent from https://github.com/kilomene/Forex-agent
+end to end: install everything on your own — the core subsystem,
+Wine, the MT5 terminal, the expert advisors, and the bridge
+daemons — launch it all, verify it's healthy, and leave trading
+in dry-run mode. When everything is running, ask me for the
+configuration you need (credentials and risk settings).
 ```
 
-Your agent will:
+### What your agent installs and launches on its own
 
-1. Clone the repository.
-2. Run `./installer/install.sh --agent --non-interactive --prefix ~/.forex-agent`
-3. Verify Python ≥ 3.12, create the agent home (`~/.forex-agent`), write `secrets.env` (mode `0600`), and smoke-test the manifest, MCP server, and CLI.
-4. Start the four background daemons and probe the real broker/config/kill-switch state.
-5. Report a machine-readable status (`installed`, `configured`, `operational`, `needs_credentials`, …) from `~/.forex-agent/install-result.json`.
+1. **Core subsystem** — clones the repo and runs `./installer/install.sh --agent --non-interactive`: verifies Python ≥ 3.12, creates the agent home (`~/.forex-agent`), smoke-tests the manifest, MCP server, and CLI. The installer is **idempotent** — safe to re-run; it repairs instead of duplicating and never overwrites your secrets file.
+2. **Wine** — installs the Windows compatibility layer (system package, falling back to the local apt cache), so the MT5 terminal can run on Linux.
+3. **MT5 terminal** — downloads the official MetaQuotes installer and installs it headlessly, then wires the egress proxy into the Wine registry and builds the network shim (`ops/mt5-bridge/mt5_redir.c`) so the terminal can reach the broker.
+4. **Expert advisors** — compiles `NovaSignals.mq5` (observation-only signal feed) and `NovaTrader.mq5` (trade execution) and attaches them to their charts.
+5. **Bridge daemons** — launches the signal bridge (Telegram alerts), the trade executor (risk-gated execution + full journaling), and the daemon supervisor.
+6. **Self-healing watchdogs** — starts `watch_mt5.py`, which detects a wiped Wine install or dead terminal and reinstalls/relaunches automatically (about 5 minutes recovery), plus 15-minute trade-data backups with close reconciliation.
+7. **Verification** — probes the real state (feed freshness, daemon liveness, broker status, kill-switch state) and reports a machine-readable status (`installed`, `configured`, `operational`, `needs_credentials`, …).
 
-The installer is **idempotent** — safe to re-run any time; it repairs instead of duplicating and never overwrites your secrets file.
+### Then it asks you for configuration
+
+Only the human-only bits need you — your agent will ask for:
+
+- **MT5 demo credentials** — login, password, server (demo only; the executor refuses non-demo servers)
+- **Telegram** — bot token and chat ID, if you want signal/trade alerts
+- **Risk settings** — per-trade risk %, daily-loss limit, max concurrent positions (sensible defaults are already in place)
+- **Arming live trading** — everything starts in **dry-run / observation mode**; nothing trades until you explicitly say so
+
+Secrets go to the environment / `secrets.env` (mode `0600`) — never into the repo, logs, or chat.
 
 ![Install flow](docs/img/install-flow.svg)
 
