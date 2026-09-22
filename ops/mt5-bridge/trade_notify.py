@@ -62,6 +62,11 @@ def main():
                 continue
             if e.get("type") not in WANTED:
                 continue
+            # Historical backfills (authoritative QueryClose reconciliation)
+            # are journaled for the record; they are not live exits, so
+            # they must not fire real-time close alerts.
+            if e.get("reconciled"):
+                continue
             key = f"{e.get('type')}:{e.get('ticket')}:{e.get('signal_id')}"
             if key in seen:
                 continue

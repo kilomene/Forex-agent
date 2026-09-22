@@ -47,6 +47,7 @@ Usage:
 import json
 import math
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -72,10 +73,11 @@ DEFAULT_CONFIG = {
     "max_correlated_positions": 1,   # repo RiskPolicy: block_correlated_same_currency
     "require_stop_loss": True,       # repo RiskPolicy: require_stop_loss
     "capital_basis": 0,              # owner order 2026-09-22: allocated trading
-                                   # capital in USD. 0 = disabled (risk sized
-                                   # off broker equity). When > 0, position
-                                   # sizing and the daily-loss gate use this
-                                   # basis instead of broker equity.
+                                   # capital in USD. FAIL-CLOSED: must be a
+                                   # finite positive number; anything else
+                                   # (missing/0/negative/NaN/inf) makes
+                                   # effective_risk_basis() return None and
+                                   # decisions skip 'risk_basis_unavailable'.
 }
 
 SPECS_MAX_AGE_S = 300
@@ -248,8 +250,10 @@ def apply_risk_bounds(cfg):
             f"{DEFAULT_CONFIG['max_spread_points']}")
         cfg["max_spread_points"] = DEFAULT_CONFIG["max_spread_points"]
     # capital_basis: owner-allocated trading capital in USD (2026-09-22).
-    # 0/None = disabled (risk sized off broker equity). Must be a
-    # non-negative number; anything else falls back to disabled.
+    # FAIL-CLOSED: anything that is not a finite positive number is
+    # normalized to 0 here; effective_risk_basis() then treats it as
+    # unavailable, so decisions skip with 'skipped:risk_basis_unavailable'
+    # instead of silently sizing off broker equity.
     try:
         cb = float(cfg.get("capital_basis") or 0)
     except (TypeError, ValueError):
@@ -266,20 +270,25 @@ def apply_risk_bounds(cfg):
 def effective_risk_basis(cfg, account_equity):
     """Owner-allocated capital basis for risk sizing (pure function).
 
-    Returns the capital_basis from cfg, but never more than the account
-    actually holds. 0 means disabled: risk is sized off broker equity.
+    FAIL-CLOSED (2026-09-22): missing, malformed, non-finite (NaN, +inf,
+    -inf), zero, or negative configured basis OR broker equity returns
+    None. The caller must treat None as 'skipped:risk_basis_unavailable':
+    the configured basis is NEVER trusted without valid broker equity.
+    Valid inputs return min(configured basis, broker equity).
     """
     try:
-        cb = float((cfg or {}).get("capital_basis") or 0)
+        cb = float((cfg or {}).get("capital_basis"))
     except (TypeError, ValueError):
-        cb = 0.0
-    if cb <= 0:
-        return 0
+        return None
     try:
-        eq = float(account_equity or 0)
+        eq = float(account_equity)
     except (TypeError, ValueError):
-        eq = 0.0
-    return min(cb, eq) if eq > 0 else cb
+        return None
+    if not (math.isfinite(cb) and math.isfinite(eq)):
+        return None
+    if cb <= 0 or eq <= 0:
+        return None
+    return min(cb, eq)
 
 
 def config_sig(cfg):
@@ -346,6 +355,23 @@ def save_state(path, state):
     with open(tmp, "w") as f:
         json.dump(state, f)
     os.replace(tmp, path)
+
+
+def normalize_seen_keys(raw):
+    """Return a set of JSON-stable dedup key strings.
+
+    Dedup keys are plain strings ("type|command_id|ticket|deal") so they
+    survive a JSON save->reload round-trip. Older states may hold a key as a
+    list (it was a tuple before the JSON round-trip); those are migrated to
+    the string form instead of crashing set() with "unhashable type: 'list'"
+    (the trades_seen crash-loop regression this guards).
+    """
+    seen = set()
+    for k in raw or []:
+        if isinstance(k, (list, tuple)):
+            k = "|".join("" if v is None else str(v) for v in k)
+        seen.add(k)
+    return seen
 
 
 def load_config(config_path):
@@ -434,7 +460,7 @@ def compute_volume(equity, risk_pct, entry, stop_loss, spec):
     return volume, risk_amount, None
 
 
-def load_trade_state(trades_path, today_str):
+def load_trade_state(trades_path, today_str, journal_path=None):
     """
     Parse nova_trades.jsonl into open positions and today's closed P/L.
     Returns (open_positions, todays_profit, consecutive_losses) where
@@ -443,10 +469,38 @@ def load_trade_state(trades_path, today_str):
     profit < 0 (a win or breakeven resets the count). NOTE: only closes
     the EA itself reports appear here; broker-side SL/TP exits are picked
     up once the EA's position reconciliation is live.
+
+    Tickets named in a journal "positions.reconciled" event are phantom
+    positions the broker no longer holds (broker sync reported 0 while
+    the journal still listed them open). They are excluded from the gate
+    view so they can never block the correlation / concurrency / dup
+    gates again. Their P&L stays UNKNOWN -- this changes no close or
+    profit records. Ticket ids are compared as strings because journal
+    writers mix int and str forms.
     """
     opened = {}
     closed_tickets = set()
     closed = []
+    corrections = {}
+    reconciled_tickets = set()
+    if journal_path:
+        try:
+            with open(journal_path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except ValueError:
+                        continue
+                    if ev.get("type") == "positions.reconciled":
+                        for x in ev.get("tickets_closed") or []:
+                            t = (x or {}).get("ticket")
+                            if t is not None:
+                                reconciled_tickets.add(str(t))
+        except OSError:
+            pass
     try:
         with open(trades_path, encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -471,35 +525,63 @@ def load_trade_state(trades_path, today_str):
                     if ticket is not None:
                         closed_tickets.add(ticket)
                     closed.append(ev)
+                elif t == "trade.close_corrected":
+                    # Authoritative broker revision of a previously journaled
+                    # provisional close (e.g. swap was missing). Overrides
+                    # that ticket's profit in P&L accounting below; the
+                    # original provisional event is left untouched.
+                    ticket = ev.get("ticket")
+                    if ticket is not None:
+                        corrections[str(ticket)] = ev
                 # trade.rejected opens nothing
     except OSError:
         pass
+    if (reconciled_tickets
+            and reconciled_tickets != getattr(load_trade_state, "_last_logged", None)):
+        load_trade_state._last_logged = set(reconciled_tickets)
+        log(f"phantom reconcile: excluding {len(reconciled_tickets)} "
+            f"broker-confirmed-gone ticket(s) from gate view")
     open_positions = {
-        t: info for t, info in opened.items() if t not in closed_tickets
+        t: info for t, info in opened.items()
+        if t not in closed_tickets and str(t) not in reconciled_tickets
     }
-    todays_profit = 0.0
-    for ev in closed:
-        dt = parse_mt5_time(ev.get("time"))
-        ev_date = dt.date().isoformat() if dt else None
-        if ev_date == today_str:
+    def eff_profit(ev):
+        """Authoritative P&L for a close: a trade.close_corrected revision
+        wins over the original provisional close; net_profit (incl.
+        commission/swap) is preferred over the bare profit field."""
+        ticket = ev.get("ticket")
+        corr = corrections.get(str(ticket)) if ticket is not None else None
+        src = corr if corr is not None else ev
+        for k in ("net_profit", "profit"):
             try:
-                todays_profit += float(ev.get("profit") or 0)
+                v = src.get(k)
+                if v is not None:
+                    return float(v)
             except (TypeError, ValueError):
-                pass
+                continue
+        return 0.0
+
+    # Effective close view: a trade.close_corrected revision overlays the
+    # original provisional close (authoritative timestamp and net P&L win).
+    items = []
+    for ev in closed:
+        ticket = ev.get("ticket")
+        corr = corrections.get(str(ticket)) if ticket is not None else None
+        src = corr if corr is not None else ev
+        ts = (parse_mt5_time(src.get("exit_time_broker") or src.get("time"))
+              or datetime.min)
+        d = ts.date().isoformat()
+        items.append((ts, d, eff_profit(ev), ev))
+
+    todays_profit = sum(p for _ts, d, p, _ev in items if d == today_str)
     consecutive_losses = 0
-    for ev in sorted(closed,
-                     key=lambda e: parse_mt5_time(e.get("time"))
-                     or datetime.min):
+    for _ts, _d, p, ev in sorted(items, key=lambda x: x[0]):
         # auto_loss_cap closes of non-bot positions ("managed":"auto-cap")
         # are real P&L (counted in todays_profit above) but are not
         # strategy trades, so they must not trip the consecutive-loss
         # halt for the bot's own strategy.
         if (ev.get("reason") == "auto_loss_cap"
                 and ev.get("managed") == "auto-cap"):
-            continue
-        try:
-            p = float(ev.get("profit") or 0)
-        except (TypeError, ValueError):
             continue
         consecutive_losses = consecutive_losses + 1 if p < 0 else 0
     return open_positions, todays_profit, consecutive_losses
@@ -542,7 +624,10 @@ def check_gates(sig, *, enabled, dry_run, specs, specs_fresh,
     Run the risk gates in order; first failure wins.
     Returns (decision, flags) where flags may carry loud/trip side effects.
     Pure function: no I/O.
-    risk_basis: owner-allocated capital (USD). When > 0 it replaces broker
+    risk_basis: owner-allocated capital (USD). FAIL-CLOSED: None means the
+    configured capital or the broker equity was missing, malformed,
+    non-finite, or non-positive (see effective_risk_basis); the decision
+    is then 'skipped:risk_basis_unavailable'. A valid basis replaces broker
     equity for position sizing and the daily-loss gate. The
     floating-drawdown gate keeps using real balance/equity.
     """
@@ -550,17 +635,20 @@ def check_gates(sig, *, enabled, dry_run, specs, specs_fresh,
     entry = sig.get("entry_price")
     sl = sig.get("stop_loss")
 
-    # Owner-allocated capital basis (2026-09-22): sizing and the daily-loss
-    # gate run off this instead of broker equity when set.
-    try:
-        rb = float(risk_basis) if risk_basis else 0.0
-    except (TypeError, ValueError):
-        rb = 0.0
-    sizing_equity = rb if rb > 0 else equity
-
     # 1. not enabled (config or kill switch)
     if not enabled:
         return "skipped:trading_disabled", {}
+
+    # 1b. owner-allocated capital basis (2026-09-22): fail closed. A basis
+    # that is None, non-numeric, non-finite, or non-positive means the
+    # trade cannot be sized -- it must not be placed.
+    try:
+        rb = float(risk_basis)
+    except (TypeError, ValueError):
+        rb = float("nan")
+    if not math.isfinite(rb) or rb <= 0:
+        return "skipped:risk_basis_unavailable", {"loud": True}
+    sizing_equity = rb
 
     # 0. stop-loss mandatory: a signal without SL/TP is never traded
     if require_stop_loss and not (sl and sig.get("take_profit")):
@@ -701,6 +789,55 @@ def server_market_state(specs):
     return market_open, ctx
 
 
+# ---------------------------------------------------------------- phantom
+# reconciliation
+#
+# The NovaTrader EA can miss closes across terminal restarts, leaving
+# phantom entries in the executor's open_map. The MT5 terminal log records
+# a 'terminal synchronized with ...: N positions, M orders' line on every
+# (re)connect; the LATEST such line is broker-authoritative for how many
+# positions actually exist. When it reports exactly 0 while open_map is
+# non-empty, the entries are phantoms and are cleared (no P&L invented).
+
+SYNC_LINE_RE = re.compile(
+    r"terminal synchronized with .*: (\d+) positions, (\d+) orders")
+DEFAULT_LOGS_DIR = os.path.join(
+    os.path.dirname(BASE), "prefix", "drive_c",
+    "Program Files", "MetaTrader 5", "logs")
+
+
+def latest_terminal_position_count(logs_dir=None):
+    """Position count from the latest MT5 terminal 'synchronized' line.
+
+    Reads today's terminal log (UTF-16LE) at <logs_dir>/YYYYMMDD.log and
+    returns (count, exact_line_text) for the LAST line matching
+    'terminal synchronized with ...: N positions, M orders'.
+    Returns (None, None) when the log file or any sync line is
+    unavailable. Never raises; scans only the log tail (64 KiB).
+    """
+    d = logs_dir or DEFAULT_LOGS_DIR
+    path = os.path.join(d, datetime.now().strftime("%Y%m%d") + ".log")
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None, None
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, size - 65536))
+            raw = f.read()
+        text = raw.decode("utf-16-le", errors="replace")
+    except OSError:
+        return None, None
+    count = None
+    line_text = None
+    for line in text.splitlines():
+        m = SYNC_LINE_RE.search(line)
+        if m:
+            count = int(m.group(1))
+            line_text = line.strip()
+    return count, line_text
+
+
 # ---------------------------------------------------------------- engine
 
 class TraderEngine:
@@ -768,13 +905,9 @@ class TraderEngine:
         offset = self.state.get("trades_offset", 0)
         if size < offset:
             offset = 0
-        # Dedup keys are plain strings (JSON-stable). Older states may hold
-        # the key as a list (a tuple before the JSON round-trip); migrate.
-        seen = set()
-        for k in self.state.get("trades_seen", []):
-            if isinstance(k, (list, tuple)):
-                k = "|".join("" if v is None else str(v) for v in k)
-            seen.add(k)
+        # Dedup keys are plain strings (JSON-stable); normalize_seen_keys
+        # migrates legacy list-form keys (tuples before the JSON round-trip).
+        seen = normalize_seen_keys(self.state.get("trades_seen", []))
         open_map = self.state.get("open_map", {})
         cmd_index = self.state.get("cmd_index", {})
         linked = 0
@@ -819,7 +952,8 @@ class TraderEngine:
                         f"ticket={ev.get('ticket')} cmd={ev.get('command_id')}")
                 elif t == "trade.closed":
                     info = open_map.pop(str(ev.get("ticket")), {})
-                    closed_dt = parse_mt5_time(ev.get("time"))
+                    closed_dt = parse_mt5_time(
+                        ev.get("exit_time_broker") or ev.get("time"))
                     opened_dt = parse_mt5_time(info.get("time"))
                     hold_s = None
                     if closed_dt and opened_dt:
@@ -832,23 +966,46 @@ class TraderEngine:
                         "profit": ev.get("profit"),
                         "reason": ev.get("reason"),
                     })
-                    events.append({
+                    # Mirror the FULL source event (deal ids,
+                    # confirmation_status, net_profit, reconciled flag,
+                    # audit source/note survive). Linked open info only
+                    # fills gaps the source leaves empty. Dropping the
+                    # flag here once caused backfilled closes to fire
+                    # real-time alerts and lose their audit trail.
+                    rec = dict(ev)
+                    rec.update({
                         "type": "trade.closed",
                         "ticket": ev.get("ticket"),
-                        "symbol": info.get("symbol"),
-                        "direction": info.get("direction"),
-                        "volume": info.get("volume"),
-                        "entry_price": info.get("entry_price"),
+                        "symbol": ev.get("symbol") or info.get("symbol"),
+                        "direction":
+                            ev.get("direction") or info.get("direction"),
+                        "volume": (ev.get("volume")
+                                   if ev.get("volume") is not None
+                                   else info.get("volume")),
+                        "entry_price": (ev.get("entry_price")
+                                        if ev.get("entry_price") is not None
+                                        else info.get("entry_price")),
                         "exit_price": ev.get("exit_price"),
                         "profit": ev.get("profit"),
                         "hold_seconds": hold_s,
                         "reason": ev.get("reason"),
                         "time": ev.get("time"),
-                        "signal_id": info.get("signal_id"),
-                        "command_id": info.get("command_id"),
+                        "signal_id":
+                            ev.get("signal_id") or info.get("signal_id"),
+                        "command_id":
+                            ev.get("command_id") or info.get("command_id"),
                     })
+                    events.append(rec)
                     log(f"journal linked {t} ticket={ev.get('ticket')} "
-                        f"profit={ev.get('profit')}")
+                        f"profit={ev.get('profit')} "
+                        f"reconciled={bool(ev.get('reconciled'))}")
+                elif t == "trade.close_corrected":
+                    # Authoritative revision of a provisional close: journal
+                    # verbatim so reports see the corrected net. The
+                    # notifier ignores this type (no live alert).
+                    events.append(dict(ev))
+                    log(f"journal linked {t} ticket={ev.get('ticket')} "
+                        f"net={ev.get('net_profit')}")
                 elif t == "trade.rejected":
                     events.append({
                         "type": "trade.update",
@@ -984,7 +1141,8 @@ class TraderEngine:
         today_str = server_today_str(specs)
         market_open, ctx = server_market_state(specs)
         open_positions, todays_profit, consecutive_losses = load_trade_state(
-            self.paths["trades"], today_str
+            self.paths["trades"], today_str,
+            journal_path=self.paths["journal"],
         )
 
         # config change detection: journal when effective risk config changes
@@ -1059,7 +1217,8 @@ class TraderEngine:
                 # mid-batch takes effect immediately
                 kill_on = kill_switch_on(self.paths["kill"])
                 open_positions, todays_profit, consecutive_losses = load_trade_state(
-                    self.paths["trades"], today_str
+                    self.paths["trades"], today_str,
+                    journal_path=self.paths["journal"],
                 )
                 # PORT (repo: positions as explicit risk input): merge the
                 # EA's broker-wide positions feed so exposure/concurrency/
@@ -1127,8 +1286,47 @@ class TraderEngine:
         return decisions
 
     # -- main pass --------------------------------------------------------
+    # -- phantom reconciliation ----------------------------------------
+    def reconcile_phantom_positions(self, logs_dir=None):
+        """Clear open_map entries the broker no longer holds.
+
+        The EA can miss closes across terminal restarts, leaving phantom
+        entries in open_map that keep blocking the correlation gate. If
+        the latest MT5 terminal 'synchronized' line reports EXACTLY 0
+        positions while open_map is non-empty, those entries are phantoms:
+        journal a positions.reconciled event (no P&L invented -- outcomes
+        stay UNKNOWN pending authoritative MT5 deal history), clear
+        open_map, and save state. Conservative: acts only on count == 0;
+        None (log unavailable) or > 0 is a no-op. Returns the number of
+        entries cleared.
+        """
+        open_map = self.state.get("open_map", {})
+        if not open_map:
+            return 0
+        count, line = latest_terminal_position_count(logs_dir)
+        if count != 0:
+            return 0
+        tickets = [{"ticket": t, "symbol": (info or {}).get("symbol")}
+                   for t, info in open_map.items()]
+        self.journal({
+            "type": "positions.reconciled",
+            "tickets_closed": tickets,
+            "source": line,
+            "note": ("EA never emitted trade.closed; cleared from open_map. "
+                     "P&L remains UNKNOWN pending authoritative MT5 deal "
+                     "history. No P&L figures created or implied."),
+        })
+        self.state["open_map"] = {}
+        self.save()
+        log("!!! PHANTOM RECONCILE: cleared "
+            f"{len(tickets)} phantom position(s) from open_map "
+            f"(broker reports 0 positions): "
+            + ", ".join(f"{x['ticket']}/{x['symbol']}" for x in tickets))
+        return len(tickets)
+
     def run_once(self):
         self.tail_trades()
+        self.reconcile_phantom_positions()
         return self.process_signals()
 
 

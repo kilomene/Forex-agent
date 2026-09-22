@@ -54,6 +54,9 @@ def gate_ctx(**over):
         consecutive_losses=0,
         max_correlated_positions=1,
         require_stop_loss=True,
+        # fail-closed risk basis (2026-09-22): None/invalid -> skip.
+        # Baseline fixtures carry a valid basis so other gates are tested.
+        risk_basis=1_000_000.0,
     )
     ctx.update(over)
     return ctx
@@ -131,6 +134,7 @@ def make_sandbox(tmp_path, *, trading_enabled=True, dry_run=True):
         "trading_enabled": trading_enabled, "dry_run": dry_run,
         "risk_per_trade_pct": 0.5, "max_concurrent_trades": 3,
         "max_daily_loss_pct": 2.0, "max_spread_points": 50,
+        "capital_basis": 200000,
     }))
     (state / "trading_enabled").write_text("1")
     return str(files), str(state)
@@ -447,7 +451,7 @@ def test_gate_dry_run_disabled_wins():
 def test_gate_volume_below_min():
     d, _ = te.check_gates(
         sig(entry_price=1310.0, stop_loss=1300.0),
-        **gate_ctx(equity=100.0,
+        **gate_ctx(equity=100.0, risk_basis=100.0,
                    specs={"symbols": {"XPDUSD": spec()}}))
     assert d == "skipped:volume_below_min"
 
@@ -508,7 +512,7 @@ def test_dry_run_logs_three_intended_writes_zero_commands(tmp_path):
     assert {e["signal_id"] for e in decs} == {s["id"] for s in FIXTURE_SIGNALS}
     for e in decs:
         assert e["volume"] and e["volume"] > 0
-        assert e["risk_amount"] == pytest.approx(5000.0)
+        assert e["risk_amount"] == pytest.approx(1000.0)  # 0.5% of $200,000
     cmd_p = os.path.join(files, "nova_commands.jsonl")
     assert os.path.getsize(cmd_p) == 0  # exists (startup touch), zero commands written
 
@@ -762,15 +766,17 @@ def test_effective_risk_basis_clamped_to_account_equity():
     assert te.effective_risk_basis({"capital_basis": 5_000_000}, 1_000_000) == 1_000_000
 
 
-def test_effective_risk_basis_zero_disables():
-    assert te.effective_risk_basis({"capital_basis": 0}, 1_000_000) == 0
-    assert te.effective_risk_basis({}, 1_000_000) == 0
+def test_effective_risk_basis_zero_unavailable():
+    # FAIL-CLOSED (2026-09-22): zero/missing basis -> None, never equity.
+    assert te.effective_risk_basis({"capital_basis": 0}, 1_000_000) is None
+    assert te.effective_risk_basis({}, 1_000_000) is None
 
 
-def test_effective_risk_basis_invalid_disables():
-    assert te.effective_risk_basis({"capital_basis": -100}, 1_000_000) == 0
-    assert te.effective_risk_basis({"capital_basis": "bogus"}, 1_000_000) == 0
-    assert te.effective_risk_basis(None, 1_000_000) == 0
+def test_effective_risk_basis_invalid_unavailable():
+    assert te.effective_risk_basis({"capital_basis": -100}, 1_000_000) is None
+    assert te.effective_risk_basis({"capital_basis": "bogus"},
+                                   1_000_000) is None
+    assert te.effective_risk_basis(None, 1_000_000) is None
 
 
 def test_apply_risk_bounds_capital_basis_validation():
@@ -783,26 +789,27 @@ def test_apply_risk_bounds_capital_basis_validation():
 
 
 def test_gate_sizing_uses_capital_basis():
-    # 1% of $200,000 = $2,000 planned risk
-    d, flags = te.check_gates(sig(), **gate_ctx(risk_basis=200000.0))
+    # 0.5% of $200,000 = $1,000 planned risk (owner order 2026-09-22)
+    d, flags = te.check_gates(sig(), **gate_ctx(risk_basis=200000.0,
+                                               risk_pct=0.5))
     assert d == "commanded"
-    assert flags["risk_amount"] == pytest.approx(2000.0)
+    assert flags["risk_amount"] == pytest.approx(1000.0)
 
 
-def test_gate_sizing_zero_basis_falls_back_to_equity():
-    # 1% of 1e6 equity = $10,000 (prior behavior preserved)
+def test_gate_sizing_zero_basis_fails_closed():
+    # FAIL-CLOSED (2026-09-22): zero basis is unavailable, not equity.
     d, flags = te.check_gates(sig(), **gate_ctx(risk_basis=0))
-    assert d == "commanded"
-    assert flags["risk_amount"] == pytest.approx(10000.0)
+    assert d == "skipped:risk_basis_unavailable"
+    assert flags.get("loud") is True
 
 
-def test_gate_sizing_invalid_basis_falls_back_to_equity():
-    d, flags = te.check_gates(sig(), **gate_ctx(risk_basis="bogus"))
-    assert d == "commanded"
-    assert flags["risk_amount"] == pytest.approx(10000.0)
-    d, flags = te.check_gates(sig(), **gate_ctx(risk_basis=-500))
-    assert d == "commanded"
-    assert flags["risk_amount"] == pytest.approx(10000.0)
+def test_gate_sizing_invalid_basis_fails_closed():
+    d, _ = te.check_gates(sig(), **gate_ctx(risk_basis="bogus"))
+    assert d == "skipped:risk_basis_unavailable"
+    d, _ = te.check_gates(sig(), **gate_ctx(risk_basis=-500))
+    assert d == "skipped:risk_basis_unavailable"
+    d, _ = te.check_gates(sig(), **gate_ctx(risk_basis=float("nan")))
+    assert d == "skipped:risk_basis_unavailable"
 
 
 def test_gate_daily_loss_limit_uses_capital_basis():
@@ -812,8 +819,8 @@ def test_gate_daily_loss_limit_uses_capital_basis():
                           todays_profit=-6001.0))
     assert d == "skipped:daily_loss_limit"
     assert flags.get("trip") is True
-    # same loss on the full 1e6 equity would NOT trip (3% = $30,000)
+    # same loss against a $1,000,000 basis would NOT trip (3% = $30,000)
     d, _ = te.check_gates(
-        sig(), **gate_ctx(risk_basis=0, max_daily_loss_pct=3.0,
+        sig(), **gate_ctx(risk_basis=1_000_000.0, max_daily_loss_pct=3.0,
                           todays_profit=-6001.0))
     assert d == "commanded"

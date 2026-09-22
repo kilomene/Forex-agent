@@ -34,6 +34,9 @@ def gate_ctx(**over):
         today_str="2026-09-21", risk_pct=0.5, max_concurrent=3,
         max_spread_points=50, max_daily_loss_pct=2.0, equity=1_000_000.0,
         market_open=True,
+        # fail-closed risk basis (2026-09-22): None/invalid -> skip.
+        # Baseline fixtures carry a valid basis so other gates are tested.
+        risk_basis=1_000_000.0,
     )
     ctx.update(over)
     return ctx
@@ -71,6 +74,7 @@ def make_sandbox(tmp_path, *, trading_enabled=True, dry_run=True,
         "trading_enabled": trading_enabled, "dry_run": dry_run,
         "risk_per_trade_pct": 0.5, "max_concurrent_trades": 3,
         "max_daily_loss_pct": 2.0, "max_spread_points": 50,
+        "capital_basis": 200000,
     }))
     (state / "trading_enabled").write_text("1")
     return str(files), str(state)

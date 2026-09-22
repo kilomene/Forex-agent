@@ -153,6 +153,10 @@ def cmd_init():
     with open(os.path.join(BASE, "EXPERIMENT_CHARTER.md"), "rb") as f:
         ok &= put_file("EXPERIMENT_CHARTER.md", f.read(),
                        "experiment: charter")
+    # Never stage state/secret/binary artifacts: refuse .db/.sqlite/.so/.env
+    # in the git-bound file list (defense in depth on top of .gitignore).
+    from backup_trading import refuse_git_paths
+    refuse_git_paths(TRADER_FILES, where="push_evidence TRADER_FILES")
     for name in TRADER_FILES:
         local = os.path.join(BASE, name)
         if not os.path.exists(local):
