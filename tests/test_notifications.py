@@ -291,5 +291,159 @@ class ConfigWiringTestCase(unittest.TestCase):
             del os.environ["NOTIFY_WEBHOOK_URL"]
 
 
+class _FakeHTTPResponse:
+    """Minimal urlopen stand-in: context manager with status + read()."""
+
+    def __init__(self, status=200, body=b'{"ok": true}'):
+        self.status = status
+        self._body = body
+
+    def read(self, n=-1):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class TelegramChannelTestCase(unittest.TestCase):
+    def setUp(self):
+        self._real_urlopen = urllib.request.urlopen
+
+    def tearDown(self):
+        urllib.request.urlopen = self._real_urlopen
+
+    def _ch(self, **kw):
+        kw.setdefault("enabled", True)
+        kw.setdefault("bot_token", "TESTTOKEN123")
+        kw.setdefault("chat_id", "987654321")
+        return ch.TelegramChannel(**kw)
+
+    def _install_fake(self, response=None, exc=None):
+        captured = {}
+
+        def _fake(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["data"] = req.data
+            captured["timeout"] = timeout
+            if exc is not None:
+                raise exc
+            return response or _FakeHTTPResponse()
+
+        urllib.request.urlopen = _fake
+        return captured
+
+    def test_telegram_unconfigured_by_default(self):
+        self.assertFalse(ch.TelegramChannel().is_configured())
+
+    def test_telegram_needs_token_and_chat(self):
+        self.assertFalse(
+            self._ch(bot_token="", chat_id="1").is_configured())
+        self.assertFalse(
+            self._ch(bot_token="t", chat_id="").is_configured())
+        self.assertFalse(
+            self._ch(enabled=False).is_configured())
+        self.assertTrue(self._ch().is_configured())
+
+    def test_telegram_send_posts_to_bot_api(self):
+        captured = self._install_fake()
+        chan = self._ch()
+        chan.send({"event_id": "e1", "severity": "NOTICE",
+                   "event": "signal.detected", "symbol": "EURUSD",
+                   "timeframe": "M15", "direction": "BUY",
+                   "entry_price": 1.0852, "stop_loss": 1.083,
+                   "take_profit": 1.0895})
+        self.assertEqual(
+            captured["url"],
+            "https://api.telegram.org/botTESTTOKEN123/sendMessage")
+        import json as _json
+        payload = _json.loads(captured["data"].decode("utf-8"))
+        self.assertEqual(payload["chat_id"], "987654321")
+        text = payload["text"]
+        self.assertIn("SIGNAL DETECTED", text)
+        self.assertIn("EURUSD", text)
+        self.assertIn("BUY", text)
+        self.assertIn("1.0852", text)
+
+    def test_telegram_generic_event_is_one_liner(self):
+        captured = self._install_fake()
+        self._ch().send({"event_id": "e2", "severity": "CRITICAL",
+                         "event": "risk.kill_switch_engaged"})
+        import json as _json
+        payload = _json.loads(captured["data"].decode("utf-8"))
+        self.assertEqual(payload["text"],
+                         "[CRITICAL] risk.kill_switch_engaged")
+
+    def test_telegram_http_error_raises(self):
+        import urllib.error as _uerr
+        captured = self._install_fake(
+            exc=_uerr.HTTPError("u", 401, "Unauthorized", {}, None))
+        with self.assertRaises(ch.NotificationError):
+            self._ch().send({"event_id": "e3", "severity": "NOTICE"})
+
+    def test_telegram_network_error_raises(self):
+        import urllib.error as _uerr
+        self._install_fake(exc=_uerr.URLError("conn refused"))
+        with self.assertRaises(ch.NotificationError):
+            self._ch().send({"event_id": "e4", "severity": "NOTICE"})
+
+    def test_telegram_ok_false_raises(self):
+        self._install_fake(
+            _FakeHTTPResponse(200, b'{"ok": false, "error_code": 400}'))
+        with self.assertRaises(ch.NotificationError):
+            self._ch().send({"event_id": "e5", "severity": "NOTICE"})
+
+    def test_telegram_health_has_no_secrets(self):
+        health = self._ch().health()
+        self.assertNotIn("TESTTOKEN123", str(health))
+        self.assertTrue(health["token_set"])
+        self.assertTrue(health["chat_id_set"])
+        self.assertTrue(health["configured"])
+
+    def test_telegram_channel_factory(self):
+        chan = ch.channel("telegram", bot_token="t", chat_id="1")
+        self.assertIsInstance(chan, ch.TelegramChannel)
+
+    def test_telegram_failure_does_not_block_agent_channel(self):
+        import urllib.error as _uerr
+        self._install_fake(exc=_uerr.URLError("down"))
+        agent = RecordingChannel("agent")
+        tg = self._ch()
+        d = NotificationDispatcher(
+            channels=[agent, tg],
+            routing={"NOTICE": ("agent", "telegram")},
+            max_attempts=1, state_dir=tempfile.mkdtemp(prefix="notify_"))
+        results = d.dispatch_event({"event_id": "e6", "severity": "NOTICE",
+                                    "event": "signal.detected"})
+        self.assertEqual(results["agent"], "sent")
+        self.assertTrue(results["telegram"].startswith("failed:"))
+        self.assertEqual(len(agent.calls), 1)
+
+    def test_env_telegram_token_enables_channel_and_is_redacted(self):
+        os.environ["NOTIFICATIONS_ENABLED"] = "1"
+        os.environ["NOTIFY_CHANNEL_TELEGRAM"] = "1"
+        os.environ["TELEGRAM_BOT_TOKEN"] = "SECRET_BOT_TOKEN"
+        os.environ["TELEGRAM_CHAT_ID"] = "12345"
+        try:
+            from config.config import load_config  # noqa: PLC0415
+            cfg = load_config()
+            d = disp_mod.build_dispatcher_from_config(cfg)
+            self.assertTrue(d.channels["telegram"].is_configured())
+            self.assertTrue(cfg.notifications.channel_telegram)
+            redacted = cfg.redacted()
+            self.assertNotIn("SECRET_BOT_TOKEN", str(redacted))
+            self.assertEqual(
+                redacted["notifications"]["telegram_bot_token"], "***")
+            # NOTICE routing includes telegram by default.
+            self.assertIn("telegram", d.routing.get("NOTICE", ()))
+        finally:
+            del os.environ["NOTIFICATIONS_ENABLED"]
+            del os.environ["NOTIFY_CHANNEL_TELEGRAM"]
+            del os.environ["TELEGRAM_BOT_TOKEN"]
+            del os.environ["TELEGRAM_CHAT_ID"]
+
+
 if __name__ == "__main__":
     unittest.main()

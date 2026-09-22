@@ -119,7 +119,7 @@ duplicating. The double-run proof lives in
 
 ```bash
 export WORKER_ENABLED=true
-export WORKER_BASE_URL='https://your-worker.workers.dev'
+export WORKER_BASE_URL='https://forex-control-plane.ayiijumo.workers.dev'
 export WORKER_API_KEY='...'
 ./installer/install.sh --non-interactive --prefix ~/.forex-agent
 ```

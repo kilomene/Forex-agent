@@ -7,7 +7,10 @@
 #   4. Provision API clients: node scripts/provision-client.mjs <client_id>
 #      and register the printed SQL in D1 before pointing clients at this Worker.
 
-name = "forex-agent-worker"
+# Live deployment (Founder-confirmed 2026-09-21):
+# https://forex-control-plane.ayiijumo.workers.dev
+# Keep this name — it determines the workers.dev URL above.
+name = "forex-control-plane"
 main = "src/index.js"
 compatibility_date = "2025-01-01"
 

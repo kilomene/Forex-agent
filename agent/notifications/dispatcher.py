@@ -41,6 +41,7 @@ from agent.notifications.channels import (  # noqa: E402
     AgentChannel,
     FCMChannel,
     NotificationChannel,
+    TelegramChannel,
     WebhookChannel,
     WorkerChannel,
 )
@@ -51,9 +52,9 @@ logger = logging.getLogger("forex_agent.notifications")
 # INFO stays on the agent channel only. Overridable via
 # ``notifications.routing`` in config/defaults.yaml.
 DEFAULT_ROUTING: Dict[str, Sequence[str]] = {
-    "CRITICAL": ("agent", "worker", "fcm", "webhook"),
-    "WARNING": ("agent", "worker"),
-    "NOTICE": ("agent", "worker"),
+    "CRITICAL": ("agent", "worker", "fcm", "webhook", "telegram"),
+    "WARNING": ("agent", "worker", "telegram"),
+    "NOTICE": ("agent", "worker", "telegram"),
     "INFO": ("agent",),
 }
 
@@ -286,6 +287,10 @@ def build_dispatcher_from_config(cfg=None) -> NotificationDispatcher:
         WebhookChannel(enabled=ncfg.channel_webhook,
                        url=ncfg.webhook_url,
                        timeout=ncfg.timeout_seconds),
+        TelegramChannel(enabled=ncfg.channel_telegram,
+                        bot_token=ncfg.telegram_bot_token,
+                        chat_id=ncfg.telegram_chat_id,
+                        timeout=ncfg.timeout_seconds),
     ]
     return NotificationDispatcher(
         channels=channels,
