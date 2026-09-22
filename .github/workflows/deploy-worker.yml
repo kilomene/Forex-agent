@@ -1,0 +1,33 @@
+name: deploy-worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "worker/**"
+      - ".github/workflows/deploy-worker.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy forex-control-plane
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Worker contract tests
+        run: node --test "worker/tests/*.test.mjs"
+      - name: Fail fast if D1 database_id is still a placeholder
+        working-directory: worker
+        run: |
+          if grep -q "REPLACE_WITH_REAL_DATABASE_ID" wrangler.toml; then
+            echo "::error::worker/wrangler.toml still has the placeholder database_id. Set the real D1 database id before deploying."
+            exit 1
+          fi
+      - name: Deploy with wrangler
+        working-directory: worker
+        run: npx -y wrangler@latest deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
