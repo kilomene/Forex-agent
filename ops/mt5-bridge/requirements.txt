@@ -1,0 +1,4 @@
+# Runtime + test dependencies for the MT5 bridge ops subsystem (ops/mt5-bridge).
+# CI installs this file (see .github/workflows/build.yml). Keep in sync with
+# the third-party imports used by the bridge scripts.
+matplotlib>=3.8

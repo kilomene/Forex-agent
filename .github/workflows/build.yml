@@ -14,7 +14,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pytest
+      - run: pip install pytest -r ops/mt5-bridge/requirements.txt
       - name: Agent subsystem suite
         run: python -m pytest tests -q
       - name: MT5 bridge ops suite
