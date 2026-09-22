@@ -517,6 +517,7 @@ def load_trade_state(trades_path, today_str, journal_path=None):
                     if ticket is not None:
                         opened[ticket] = {
                             "symbol": ev.get("symbol"),
+                            "direction": ev.get("direction"),
                             "command_id": ev.get("command_id"),
                             "signal_id": ev.get("signal_id"),
                         }
@@ -597,18 +598,26 @@ def server_today_str(specs):
     return datetime.now().date().isoformat()
 
 
-def currency_group(symbol):
-    """
-    Correlation proxy for max_correlated_positions: symbols sharing a
-    base or quote currency are treated as correlated (e.g. EURUSD and
-    GBPUSD share USD). 6-letter alpha symbols split into base/quote;
-    anything else (indices, etc.) is its own group.
-    Returns a set of group tags.
-    """
+def currency_codes(symbol):
+    """Bare currency codes for a symbol: 6-letter alpha -> {base, quote};
+    anything else (indices, etc.) is its own group."""
     s = (symbol or "").upper()
     if len(s) == 6 and s.isalpha():
-        return {"BASE:" + s[:3], "QUOTE:" + s[3:]}
-    return {"SYM:" + s}
+        return {s[:3], s[3:]}
+    return {s} if s else set()
+
+
+def signed_currency_exposure(symbol, direction):
+    """Signed unit exposure per currency: BUY = long base / short quote,
+    SELL = the reverse. Unknown direction -> {} (callers fail closed)."""
+    d = (direction or "").upper()
+    if d not in ("BUY", "SELL"):
+        return {}
+    sign = 1 if d == "BUY" else -1
+    s = (symbol or "").upper()
+    if len(s) == 6 and s.isalpha():
+        return {s[:3]: sign, s[3:]: -sign}
+    return {s: sign} if s else {}
 
 
 def check_gates(sig, *, enabled, dry_run, specs, specs_fresh,
@@ -709,16 +718,40 @@ def check_gates(sig, *, enabled, dry_run, specs, specs_fresh,
         if info.get("symbol") == symbol:
             return "skipped:symbol_already_open", {}
 
-    # 6b. correlated positions: at most max_correlated_positions open
-    # positions may share a currency group with the new signal.
+    # 6b. correlated positions: direction-aware net currency exposure.
+    # A BUY is long base / short quote, a SELL the reverse. Two positions
+    # on opposite sides of a shared currency (CHFJPY BUY is short-JPY,
+    # NZDJPY SELL is long-JPY) NET OUT instead of stacking, so they must
+    # not block each other. Block only when the new signal would raise
+    # net absolute exposure in a shared currency beyond the limit.
+    # Unknown position direction fails closed (assumed to stack).
     if max_correlated_positions and max_correlated_positions > 0:
-        groups = currency_group(symbol)
-        hits = 0
-        for info in open_positions.values():
-            if groups & currency_group(info.get("symbol")):
-                hits += 1
-        if hits >= max_correlated_positions:
-            return "skipped:correlated_position", {"loud": True}
+        cand = signed_currency_exposure(symbol, sig.get("direction"))
+        if not cand:
+            # Unknown candidate direction: conservative count-based proxy.
+            codes = currency_codes(symbol)
+            hits = sum(1 for info in open_positions.values()
+                       if codes & currency_codes(info.get("symbol")))
+            if hits >= max_correlated_positions:
+                return "skipped:correlated_position", {"loud": True}
+        else:
+            net = {}
+            for info in open_positions.values():
+                expos = signed_currency_exposure(info.get("symbol"),
+                                                 info.get("direction"))
+                if not expos:
+                    shared = (currency_codes(info.get("symbol"))
+                              & set(cand))
+                    for cur in shared:
+                        expos[cur] = 1 if cand[cur] > 0 else -1
+                for cur, e in expos.items():
+                    net[cur] = net.get(cur, 0) + e
+            for cur, cexp in cand.items():
+                cur_net = net.get(cur, 0)
+                new_net = cur_net + cexp
+                if (abs(new_net) > max_correlated_positions
+                        and abs(new_net) > abs(cur_net)):
+                    return "skipped:correlated_position", {"loud": True}
 
     # 6c. consecutive losses: after max_consecutive_losses straight
     # losing closes, no new entries until a winner resets the count.
@@ -801,6 +834,7 @@ def server_market_state(specs):
 
 SYNC_LINE_RE = re.compile(
     r"terminal synchronized with .*: (\d+) positions, (\d+) orders")
+SYNC_TIME_RE = re.compile(r"\t(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?\t")
 DEFAULT_LOGS_DIR = os.path.join(
     os.path.dirname(BASE), "prefix", "drive_c",
     "Program Files", "MetaTrader 5", "logs")
@@ -836,6 +870,26 @@ def latest_terminal_position_count(logs_dir=None):
             count = int(m.group(1))
             line_text = line.strip()
     return count, line_text
+
+
+def parse_sync_line_time(line):
+    """HH:MM:SS(.mmm) from a terminal log line -> today's datetime.
+
+    Terminal-log and EA-event times share the terminal clock, so they are
+    directly comparable. None when unparseable.
+    """
+    if not line:
+        return None
+    m = SYNC_TIME_RE.search(line)
+    if not m:
+        return None
+    try:
+        return datetime.now().replace(hour=int(m.group(1)),
+                                      minute=int(m.group(2)),
+                                      second=int(m.group(3)),
+                                      microsecond=0)
+    except ValueError:
+        return None
 
 
 # ---------------------------------------------------------------- engine
@@ -1243,6 +1297,7 @@ class TraderEngine:
                             merged[t]["_broker"] = True
                         else:
                             merged[t] = {"symbol": p.get("symbol"),
+                                         "direction": p.get("type"),
                                          "_volume": p.get("volume"),
                                          "_broker": True,
                                          "manual": True}
@@ -1306,6 +1361,19 @@ class TraderEngine:
         count, line = latest_terminal_position_count(logs_dir)
         if count != 0:
             return 0
+        # The sync line must be NEWER than every open_map entry: a stale
+        # line (e.g. 10:29) must never clear positions opened later (12:00).
+        # Unparseable sync time -> fail closed (no clear).
+        sync_dt = parse_sync_line_time(line)
+        if sync_dt is None:
+            log("phantom reconcile: sync line time unparseable; skipping")
+            return 0
+        for t, info in open_map.items():
+            opened_dt = parse_mt5_time((info or {}).get("time"))
+            if opened_dt is not None and sync_dt <= opened_dt:
+                log(f"phantom reconcile: stale sync line predates open "
+                    f"{t}; skipping")
+                return 0
         tickets = [{"ticket": t, "symbol": (info or {}).get("symbol")}
                    for t, info in open_map.items()]
         self.journal({

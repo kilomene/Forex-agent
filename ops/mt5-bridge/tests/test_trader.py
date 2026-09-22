@@ -352,6 +352,59 @@ def test_gate_uncorrelated_symbol_passes():
     assert d == "commanded"
 
 
+def test_gate_correlated_opposite_direction_allows():
+    # CHFJPY BUY is short-JPY; NZDJPY SELL is long-JPY -> they net out
+    # on JPY instead of stacking, so the gate must not block.
+    pos = {111: {"symbol": "CHFJPY", "direction": "BUY",
+                 "command_id": "c1", "signal_id": "s1"}}
+    s = sig(symbol="NZDJPY", direction="SELL", entry_price=90.092,
+            stop_loss=90.184, take_profit=89.909)
+    ctx = gate_ctx(open_positions=pos)
+    ctx["specs"] = {"symbols": {"NZDJPY": spec()},
+                    "account": {"server": "MetaQuotes-Demo",
+                                "equity": 1_000_000.0, "balance": 1_000_000.0}}
+    d, _ = te.check_gates(s, **ctx)
+    assert d == "commanded"
+
+
+def test_gate_correlated_same_direction_blocks():
+    # EURUSD BUY + GBPUSD BUY both short USD -> stacking, still blocked.
+    pos = {111: {"symbol": "EURUSD", "direction": "BUY",
+                 "command_id": "c1", "signal_id": "s1"}}
+    s = sig(symbol="GBPUSD", direction="BUY")
+    ctx = gate_ctx(open_positions=pos)
+    ctx["specs"] = {"symbols": {"GBPUSD": spec()},
+                    "account": {"server": "MetaQuotes-Demo",
+                                "equity": 1_000_000.0, "balance": 1_000_000.0}}
+    d, _ = te.check_gates(s, **ctx)
+    assert d == "skipped:correlated_position"
+
+
+def test_gate_correlated_opposite_usd_allows():
+    # EURUSD BUY (short USD) + GBPUSD SELL (long USD) net out -> allowed.
+    pos = {111: {"symbol": "EURUSD", "direction": "BUY",
+                 "command_id": "c1", "signal_id": "s1"}}
+    s = sig(symbol="GBPUSD", direction="SELL")
+    ctx = gate_ctx(open_positions=pos)
+    ctx["specs"] = {"symbols": {"GBPUSD": spec()},
+                    "account": {"server": "MetaQuotes-Demo",
+                                "equity": 1_000_000.0, "balance": 1_000_000.0}}
+    d, _ = te.check_gates(s, **ctx)
+    assert d == "commanded"
+
+
+def test_gate_correlated_unknown_direction_fails_closed():
+    # EURUSD open with unknown direction; GBPUSD BUY -> assumed to stack.
+    pos = {111: {"symbol": "EURUSD", "command_id": "c1", "signal_id": "s1"}}
+    s = sig(symbol="GBPUSD", direction="BUY")
+    ctx = gate_ctx(open_positions=pos)
+    ctx["specs"] = {"symbols": {"GBPUSD": spec()},
+                    "account": {"server": "MetaQuotes-Demo",
+                                "equity": 1_000_000.0, "balance": 1_000_000.0}}
+    d, _ = te.check_gates(s, **ctx)
+    assert d == "skipped:correlated_position"
+
+
 def test_gate_missing_sl_refused():
     s = sig(stop_loss=0)
     d, flags = te.check_gates(s, **gate_ctx())

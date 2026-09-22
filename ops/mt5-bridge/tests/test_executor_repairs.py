@@ -307,6 +307,37 @@ def test_reconcile_noop_when_open_map_empty(tmp_path):
                 if e.get("type") == "positions.reconciled"]
 
 
+def test_reconcile_noop_on_stale_sync_line(tmp_path):
+    # Regression: a 10:29 sync line must never clear positions opened at
+    # 12:00. The sync evidence has to be newer than every open entry.
+    eng, logs, state = make_engine(tmp_path)
+    write_log(logs, [SYNC_LINE])  # 10:29:27 today, 0 positions
+    eng.state["open_map"] = {
+        "10618377948": {"symbol": "EURCAD",
+                        "time": "2026.09.22 15:00:04",
+                        "direction": "BUY"},
+    }
+    assert eng.reconcile_phantom_positions(logs_dir=logs) == 0
+    assert eng.state["open_map"] != {}
+    assert not [e for e in read_journal(state)
+                if e.get("type") == "positions.reconciled"]
+
+
+def test_reconcile_clears_when_sync_line_is_fresh(tmp_path):
+    # Same zero-position sync line, but stamped after the open entry:
+    # genuine phantom, clear proceeds.
+    eng, logs, state = make_engine(tmp_path)
+    fresh = SYNC_LINE.replace("10:29:27.559", "15:05:00.000")
+    write_log(logs, [fresh])
+    eng.state["open_map"] = {
+        "10618377948": {"symbol": "EURCAD",
+                        "time": "2026.09.22 15:00:04",
+                        "direction": "BUY"},
+    }
+    assert eng.reconcile_phantom_positions(logs_dir=logs) == 1
+    assert eng.state["open_map"] == {}
+
+
 # ------------------------------------------------- mirror field preservation
 # 2026-09-22: the trades->journal mirror rebuilt trade.closed from a fixed
 # field subset, dropping reconciled/confirmation_status/net_profit/deal ids.
