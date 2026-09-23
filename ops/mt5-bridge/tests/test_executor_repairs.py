@@ -309,12 +309,16 @@ def test_reconcile_noop_when_open_map_empty(tmp_path):
 
 def test_reconcile_noop_on_stale_sync_line(tmp_path):
     # Regression: a 10:29 sync line must never clear positions opened at
-    # 12:00. The sync evidence has to be newer than every open entry.
+    # 15:00 the same day. The sync evidence has to be newer than every
+    # open entry. The open time is built from TODAY so the test cannot
+    # rot when the calendar moves (same class of bug as the old
+    # time-dependent test_get_session).
+    today = datetime.now().strftime("%Y.%m.%d")
     eng, logs, state = make_engine(tmp_path)
     write_log(logs, [SYNC_LINE])  # 10:29:27 today, 0 positions
     eng.state["open_map"] = {
         "10618377948": {"symbol": "EURCAD",
-                        "time": "2026.09.22 15:00:04",
+                        "time": f"{today} 15:00:04",
                         "direction": "BUY"},
     }
     assert eng.reconcile_phantom_positions(logs_dir=logs) == 0
@@ -327,11 +331,12 @@ def test_reconcile_clears_when_sync_line_is_fresh(tmp_path):
     # Same zero-position sync line, but stamped after the open entry:
     # genuine phantom, clear proceeds.
     eng, logs, state = make_engine(tmp_path)
+    today = datetime.now().strftime("%Y.%m.%d")
     fresh = SYNC_LINE.replace("10:29:27.559", "15:05:00.000")
     write_log(logs, [fresh])
     eng.state["open_map"] = {
         "10618377948": {"symbol": "EURCAD",
-                        "time": "2026.09.22 15:00:04",
+                        "time": f"{today} 15:00:04",
                         "direction": "BUY"},
     }
     assert eng.reconcile_phantom_positions(logs_dir=logs) == 1
