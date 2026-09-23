@@ -96,7 +96,11 @@ WINE_DEP_GLOBS = ["libcapi20-3t64_*.deb", "libgphoto2-6t64_*.deb",
                   "libz-mingw-w64_*.deb", "iso-codes_*.deb",
                   "libdw1t64_*.deb", "libexif12_*.deb", "libgd3_*.deb",
                   "libibverbs1_*.deb", "liborc-0.4-0t64_*.deb",
-                  "libnl-3-200_*.deb", "libnl-route-3-200_*.deb"]
+                  "libnl-3-200_*.deb", "libnl-route-3-200_*.deb",
+                  # Added 2026-09-23: xdotool's runtime deps. libxdo3 needs
+                  # libxtst6; both are fetched from the archive mirror into
+                  # the stash (not in the os-intent replay manifest).
+                  "libxdo3_*.deb", "libxtst6_*.deb"]
 
 
 def wine_ok():
@@ -144,10 +148,24 @@ def ensure_wine():
                     timeout=300)
                 subprocess.run(["dpkg", "--configure", "-a"],
                                capture_output=True, text=True, timeout=180)
-                if dpkg_status("wine64") == "installed":
+                # A working wine64 binary is the real gate: dpkg status can
+                # stay "unpacked" over a pure packaging pedantry (the
+                # os-intent replay installs libelf1t64 from noble-updates,
+                # whose version is NEWER than libdw1t64's strict `=` pin).
+                if dpkg_status("wine64") == "installed" or wine_ok():
                     break
                 log("ensure_wine round %d: wine64 status=%s" %
                     (round_no, dpkg_status("wine64")))
+            if dpkg_status("wine64") != "installed" and wine_ok():
+                # Binary works but packages left unconfigured: force past
+                # the version-pin mismatch once so the dpkg database is
+                # clean for future operations. The newer libelf1t64
+                # satisfies the real ABI need of libdw1t64.
+                r = subprocess.run(
+                    ["dpkg", "--configure", "-a", "--force-depends-version"],
+                    capture_output=True, text=True, timeout=180)
+                log("ensure_wine force-depends-version pass rc=%d" %
+                    r.returncode)
         else:
             log("ensure_wine: no local debs available; trying apt-get")
         if not wine_ok():
