@@ -32,6 +32,12 @@ tested; verify it live with these steps after any NovaTrader.mq5 change.
 - Honest-unknown path cannot be forced quickly (24 h missing threshold);
   code-reviewed: profit/exit_price are null, profit_status "unknown",
   note states P&L is under reconciliation and not invented.
+- REGRESSION (2026-09-23): AlreadyClosedInTradesFile used a fixed 600-char
+  window after each "trade.closed", which bled into the NEXT line and
+  matched that record's ticket (false "already closed" -> silently dropped
+  real closes for GBPCAD 10628887244 and NZDUSD 10623564384). Fixed to
+  match within the single JSON line only. The guard relies on
+  one-JSON-per-line in nova_trades.jsonl (enforced by test below).
 
 ## 4. Regression trip-wires
 - `InMaxSpreadPoints` remains vestigial: no spread filter logic may

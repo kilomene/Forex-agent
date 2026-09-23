@@ -160,3 +160,28 @@ def test_ea_close_record_contract():
             "profit must be a real number or null -- never a fabricated string"
     assert unknown["profit_status"] == "unknown"
     assert "not invented" in unknown["note"]
+
+
+def test_trades_file_one_json_per_line(tmp_path):
+    # The EA's AlreadyClosedInTradesFile guard matches a ticket within the
+    # single JSON line holding each trade.closed. If a line ever held two
+    # records, the guard could misfire (2026-09-23: a 600-char window bled
+    # into the next line and falsely reported "already closed", silently
+    # dropping real GBPCAD/NZDUSD closes). Every writer must keep
+    # one-JSON-per-line.
+    p = tmp_path / "nova_trades.jsonl"
+    p.write_text(
+        '{"type":"trade.closed","ticket":111,"profit":-1.0}\n'
+        '{"type":"trade.opened","ticket":222}\n'
+        '{"type":"trade.closed","ticket":333,"profit":2.0}\n')
+    lines = p.read_text().splitlines()
+    assert len(lines) == 3
+    for line in lines:
+        rec = json.loads(line)
+        assert rec["type"] in ("trade.opened", "trade.closed",
+                               "trade.rejected")
+    # the guard's contract: ticket 222 must NOT be found on a trade.closed
+    # line even though it follows one directly
+    for line in lines:
+        if '"trade.closed"' in line:
+            assert '"ticket":222' not in line

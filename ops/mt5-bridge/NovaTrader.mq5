@@ -463,9 +463,16 @@ bool AlreadyClosedInTradesFile(ulong ticket)
    {
       int p = StringFind(txt, "\"trade.closed\"", pos);
       if(p < 0) break;
-      int segLen = StringLen(txt) - p;
-      if(segLen > 600) segLen = 600;
-      string seg = StringSubstr(txt, p, segLen);
+      // Restrict the match to the single JSON line holding this
+      // trade.closed. A fixed char window can bleed into the NEXT line
+      // and match that record's ticket (e.g. a following trade.opened),
+      // causing a false "already closed" and a silently dropped close.
+      int lineStart = p;
+      while(lineStart > 0 && StringGetCharacter(txt, lineStart - 1) != '\n')
+         lineStart--;
+      int lineEnd = StringFind(txt, "\n", p);
+      if(lineEnd < 0) lineEnd = StringLen(txt);
+      string seg = StringSubstr(txt, lineStart, lineEnd - lineStart);
       int q = StringFind(seg, key);
       if(q >= 0)
       {
@@ -915,6 +922,11 @@ void PublishPositions()
          magic, DoubleToString(open, 8), DoubleToString(cur, 8),
          DoubleToString(pl, 2), DoubleToString(sl, 8),
          DoubleToString(tp, 8), tm);
+      // Self-healing watch list: every currently-open position is tracked
+      // for exit reconciliation, including positions opened before this
+      // EA version started (they are never in the seed file otherwise).
+      TrackTicket(ticket, sym,
+                  (ptype == POSITION_TYPE_BUY ? "BUY" : "SELL"), vol);
    }
    string js = StringFormat(
       "{\"time\":%d,\"server_time\":\"%s\",\"account\":%I64d,\"positions\":[%s]}",
