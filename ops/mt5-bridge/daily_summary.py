@@ -103,6 +103,20 @@ def main():
     mem_path = os.path.join(MEMORY_DIR, f"{today}.md")
     with open(mem_path, "a") as f:
         f.write(line + "\n")
+    # Worker C (2026-09-23): refresh the durable experiment record from
+    # the journal. Guarded so a failure here can never break the summary.
+    try:
+        import experiment as _experiment
+        _rec = _experiment.update_experiment_record(STATE_DIR)
+        if _rec.get("status") == _experiment.STATUS_COMPLETE:
+            note = (f"- 23:55 PT: experiment {_rec['experiment_id']} "
+                    f"reached DEMO_EXPERIMENT_COMPLETE; new entries halted "
+                    f"until explicit operator action.\n")
+            with open(mem_path, "a") as f:
+                f.write(note)
+            print(note.strip())
+    except Exception as e:
+        print(f"warning: experiment record update failed: {e}")
     print(line)
     return 0
 

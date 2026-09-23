@@ -351,3 +351,138 @@ def test_trades_seen_survives_json_roundtrip(tmp_path):
     assert eng3.tail_trades() == 0
     st2 = json.load(open(os.path.join(state, "trade_executor.state.json")))
     assert all(isinstance(k, str) for k in st2["trades_seen"])
+
+
+# ======================================================================
+# Worker C (2026-09-23): experiment lifecycle (experiment.py).
+# Record creation, update from a fixture journal, completion transition
+# -> DEMO_EXPERIMENT_COMPLETE + new-entry halt, and no auto-switch.
+
+import experiment as ex  # noqa: E402
+from datetime import timezone  # noqa: E402
+
+
+def _write_journal(path, events):
+    with open(path, "w", encoding="utf-8") as f:
+        for e in events:
+            f.write(json.dumps(e) + "\n")
+
+
+def _fixture_journal(path):
+    _write_journal(path, [
+        {"type": "signal.received", "signal_id": "s1", "time": "2026-09-22 10:00:00"},
+        {"type": "trade.decision", "signal_id": "s1", "decision": "commanded",
+         "time": "2026-09-22 10:00:01"},
+        {"type": "trade.closed", "ticket": 1, "profit": 150.0,
+         "time": "2026-09-22 11:00:00"},
+        {"type": "trade.closed", "ticket": 2, "profit": -60.0,
+         "time": "2026-09-22 12:00:00"},
+        {"type": "trade.closed", "ticket": 3, "profit": -40.0,
+         "time": "2026-09-22 13:00:00"},
+        {"type": "kill_switch.tripped", "reason": "daily_loss_limit",
+         "time": "2026-09-22 14:00:00"},
+        # LIVE-scoped entry: must never leak into the DEMO record.
+        {"type": "trade.closed", "ticket": 9, "profit": 99999.0,
+         "mode": "LIVE", "time": "2026-09-22 15:00:00"},
+    ])
+
+
+def test_record_creation_defaults(tmp_path):
+    rec = ex.init_record(str(tmp_path))
+    assert rec["experiment_id"] == "forex-30day-20260921"
+    assert rec["demo_account"] == 112975129
+    assert rec["broker"] == "MetaQuotes"
+    assert rec["server"] == "MetaQuotes-Demo"
+    assert rec["end_time"].startswith("2026-10-21")
+    assert rec["status"] == "RUNNING"
+    assert rec["trade_halt"] is False
+    # init is idempotent: never overwrites an existing record.
+    rec["status"] = "MUTATED"
+    with open(ex.record_path(str(tmp_path)), "w") as f:
+        json.dump(rec, f)
+    assert ex.init_record(str(tmp_path))["status"] == "MUTATED"
+
+
+def test_update_from_fixture_journal(tmp_path):
+    jp = os.path.join(str(tmp_path), "nova_journal.jsonl")
+    _fixture_journal(jp)
+    rec = ex.update_experiment_record(
+        str(tmp_path), journal_path=jp,
+        now=datetime(2026, 9, 23, 12, 0, tzinfo=timezone.utc))
+    assert rec["status"] == "RUNNING"
+    assert rec["number_of_trades"] == 3  # LIVE ticket excluded
+    assert rec["wins"] == 1
+    assert rec["losses"] == 2
+    assert rec["net_profit"] == 50.0  # 150 - 60 - 40; no 99999 leak
+    assert rec["maximum_losing_streak"] == 2
+    assert rec["kill_switch_events"] == 1
+    assert rec["profit_factor"] == pytest.approx(1.5)
+
+
+def test_completion_transition_halts_new_entries(tmp_path):
+    jp = os.path.join(str(tmp_path), "nova_journal.jsonl")
+    _fixture_journal(jp)
+    rec = ex.update_experiment_record(
+        str(tmp_path), journal_path=jp,
+        now=datetime(2026, 10, 22, 0, 0, 1, tzinfo=timezone.utc))
+    assert rec["status"] == "DEMO_EXPERIMENT_COMPLETE"
+    assert rec["trade_halt"] is True
+    assert rec["completed_at"] is not None
+    assert os.path.exists(ex.halt_path(str(tmp_path)))
+    # experiment.completed journaled exactly once.
+    types = [json.loads(l).get("type") for l in open(jp)
+             if l.strip()]
+    assert types.count("experiment.completed") == 1
+    # A second update does not re-transition or duplicate the journal.
+    rec2 = ex.update_experiment_record(
+        str(tmp_path), journal_path=jp,
+        now=datetime(2026, 10, 23, 0, 0, tzinfo=timezone.utc))
+    assert rec2["status"] == "DEMO_EXPERIMENT_COMPLETE"
+    types = [json.loads(l).get("type") for l in open(jp)
+             if l.strip()]
+    assert types.count("experiment.completed") == 1
+
+
+def test_halt_blocks_new_entries_no_auto_switch(tmp_path):
+    import trade_executor as te
+    run = str(tmp_path / "run")
+    os.makedirs(run)
+    jp = os.path.join(run, "nova_journal.jsonl")
+    _write_journal(jp, [])
+    # Complete the experiment -> halt raised.
+    ex.update_experiment_record(
+        run, journal_path=jp,
+        now=datetime(2026, 10, 22, 0, 0, 1, tzinfo=timezone.utc))
+    files = str(tmp_path / "files")
+    os.makedirs(files)
+    eng = te.TraderEngine(files_dir=files, state_dir=run)
+    cfg = dict(te.DEFAULT_CONFIG)
+    cfg.update({"trading_enabled": True, "dry_run": False,
+                "capital_basis": 200000.0})
+    s = {"id": "X1", "type": "signal.detected", "symbol": "XPDUSD",
+         "timeframe": "M15", "direction": "BUY", "entry_price": 1310.914,
+         "stop_loss": 1306.344, "take_profit": 1320.054}
+    specs = {"symbols": {"XPDUSD": {
+        "tick_value": 1.0, "tick_size": 0.001, "volume_min": 0.01,
+        "volume_max": 100.0, "volume_step": 0.01,
+        "stops_level_points": 0, "spread_points": 20, "digits": 3,
+        "point": 0.001}},
+        "account": {"server": "MetaQuotes-Demo", "equity": 200000.0,
+                    "balance": 200000.0}}
+    d = eng.handle_signal(s, cfg, True, specs, True, {}, 0.0,
+                          "2026-10-22", market_open=True)
+    assert d == "skipped:experiment_complete"
+    # No command written despite an otherwise eligible signal.
+    cmds = os.path.join(files, "nova_commands.jsonl")
+    assert os.path.getsize(cmds) == 0
+    # No LIVE switch anywhere: mode untouched, record still DEMO-scoped.
+    rec = ex.init_record(run)
+    assert rec["status"] == "DEMO_EXPERIMENT_COMPLETE"
+    assert "LIVE" not in json.dumps(rec)
+    journal_modes = {json.loads(l).get("mode") for l in open(jp)
+                     if l.strip()} - {None}
+    assert not journal_modes
+    # Explicit operator action clears the halt (and only the halt).
+    ex.resume_trading(run)
+    assert ex.init_record(run)["trade_halt"] is False
+    assert not os.path.exists(ex.halt_path(run))

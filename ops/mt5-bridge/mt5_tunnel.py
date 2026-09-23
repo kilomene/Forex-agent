@@ -27,7 +27,10 @@ LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = int(os.environ.get("TUNNEL_PORT", "9443"))
 PROXY_HOST = "hatch-egress-proxy"
 PROXY_PORT = 3128
-TARGET = "demo.metaquotes.net:443"
+# Broker host for the CONNECT tunnel. Defaults to the demo server; the LIVE
+# broker host must be supplied via MT5_TUNNEL_TARGET so the tunnel can never
+# silently point a live terminal at the demo host (or vice versa).
+TARGET = os.environ.get("MT5_TUNNEL_TARGET", "demo.metaquotes.net:443")
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 RUN_DIR = os.path.join(BASE, "run")

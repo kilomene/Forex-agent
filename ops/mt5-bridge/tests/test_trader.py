@@ -384,7 +384,8 @@ def test_gate_correlated_opposite_usd_allows():
     # EURUSD BUY (short USD) + GBPUSD SELL (long USD) net out -> allowed.
     pos = {111: {"symbol": "EURUSD", "direction": "BUY",
                  "command_id": "c1", "signal_id": "s1"}}
-    s = sig(symbol="GBPUSD", direction="SELL")
+    s = sig(symbol="GBPUSD", direction="SELL", stop_loss=1315.484,
+            take_profit=1301.774)
     ctx = gate_ctx(open_positions=pos)
     ctx["specs"] = {"symbols": {"GBPUSD": spec()},
                     "account": {"server": "MetaQuotes-Demo",

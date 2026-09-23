@@ -866,14 +866,24 @@ void WriteSpecs()
          DoubleToString(point, 8));
    }
 
+   string serverName = AccountInfoString(ACCOUNT_SERVER);
+   // Account identity for the executor's identity lock (§7): the login is
+   // authoritative from the terminal; the type is derived the same way the
+   // OnInit demo gate derives it (server name contains "demo" -> DEMO).
+   string lowerSrv = serverName;
+   StringToLower(lowerSrv);
+   string acctType = (StringFind(lowerSrv, "demo") >= 0) ? "DEMO" : "LIVE";
    string js = StringFormat(
       "{\"time\":\"%s\",\"account\":{\"equity\":%.2f,\"balance\":%.2f,"
-      "\"currency\":\"%s\",\"server\":\"%s\",\"time\":\"%s\"},\"symbols\":{%s}}",
+      "\"currency\":\"%s\",\"login\":%I64d,\"type\":\"%s\","
+      "\"server\":\"%s\",\"time\":\"%s\"},\"symbols\":{%s}}",
       TimeToString(TimeGMT(), TIME_DATE|TIME_SECONDS),
       AccountInfoDouble(ACCOUNT_EQUITY),
       AccountInfoDouble(ACCOUNT_BALANCE),
       AccountInfoString(ACCOUNT_CURRENCY),
-      JsonEscape(AccountInfoString(ACCOUNT_SERVER)),
+      AccountInfoInteger(ACCOUNT_LOGIN),
+      acctType,
+      JsonEscape(serverName),
       TimeToString(TimeTradeServer(), TIME_DATE|TIME_SECONDS),
       syms);
 
