@@ -15,9 +15,10 @@ import hashlib
 import os
 import sys
 
+import pytest
+
 BRIDGE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BRIDGE)
-
 DEPLOYED_MQ5 = os.path.expanduser(
     "~/workspace/mt5/prefix/drive_c/Program Files/MetaTrader 5/"
     "MQL5/Experts/NovaTrader.mq5")
@@ -274,15 +275,23 @@ def _md5(path):
 
 
 def test_bridge_source_matches_deployed_source():
-    """Bridge copy must never silently diverge from the deployed EA source."""
+    """Bridge copy must never silently diverge from the deployed EA source.
+
+    The deployed MT5 prefix only exists on the trading machine, so on a
+    fresh checkout (CI) this local-deployment invariant is skipped rather
+    than failed.
+    """
+    if not os.path.exists(DEPLOYED_MQ5):
+        pytest.skip("deployed NovaTrader.mq5 not present on this machine")
     assert os.path.exists(BRIDGE_MQ5), "bridge NovaTrader.mq5 missing"
-    assert os.path.exists(DEPLOYED_MQ5), "deployed NovaTrader.mq5 missing"
     assert _md5(BRIDGE_MQ5) == _md5(DEPLOYED_MQ5), (
         "bridge/NovaTrader.mq5 diverged from the deployed EA source")
 
 
 def test_repo_source_matches_deployed_source():
+    if not os.path.exists(DEPLOYED_MQ5):
+        pytest.skip("deployed NovaTrader.mq5 not present on this machine")
     if not os.path.exists(REPO_MQ5):
-        return
+        pytest.skip("local repo clone not present on this machine")
     assert _md5(REPO_MQ5) == _md5(DEPLOYED_MQ5), (
         "repo ops/mt5-bridge/NovaTrader.mq5 diverged from deployed source")

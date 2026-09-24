@@ -31,14 +31,6 @@ def _synthetic_open(ticket=FAKE_TICKET, **kw):
     return e
 
 
-def closed_tickets_in_journal():
-    tickets = set()
-    for e in rep.load_jsonl(rep.JOURNAL_PATH):
-        if e.get("type") == "trade.closed" and e.get("ticket"):
-            tickets.add(str(e["ticket"]))
-    return tickets
-
-
 def md_files_under(out_dir):
     found = {}
     for root, _, files in os.walk(out_dir):
@@ -50,37 +42,63 @@ def md_files_under(out_dir):
 
 # ---------------------------------------------------------------- coverage
 
-def test_evidence_file_exists_for_every_closed_ticket(tmp_path):
-    # Real-data contract: every ticket with a trade.closed journal event
-    # gets a per-trade evidence page. (Generates into tmp, not the live
-    # evidence dir.)
+def _write_synthetic_journal(tmp_path):
+    j = tmp_path / "journal.jsonl"
+    j.write_text("\n".join(json.dumps(e) for e in [
+        _synthetic_open(),
+        {"type": "trade.closed", "ticket": int(FAKE_TICKET),
+         "reason": "broker", "time": "2026.09.23 11:00:00",
+         "exit_price": 1.1050, "profit": 100.0,
+         "deal_in": int(FAKE_DEAL_IN), "deal_out": int(FAKE_DEAL_OUT),
+         "commission": 7.0, "swap": 0.0, "net_profit": 93.0,
+         "gross_profit": 100.0},
+    ]) + "\n")
+    return j
+
+
+def _patched_paths(monkeypatch, tmp_path, journal_path):
+    monkeypatch.setattr(rep, "JOURNAL_PATH", str(journal_path))
+    monkeypatch.setattr(rep, "TRADES_PATH", str(tmp_path / "nope.jsonl"))
+    monkeypatch.setattr(rep, "SIGNALS_PATH", str(tmp_path / "nope2.jsonl"))
+    monkeypatch.setattr(rep, "POSITIONS_PATH", str(tmp_path / "nope3.json"))
+    monkeypatch.setattr(rep, "LESSONS_DB", str(tmp_path / "nope.db"))
+
+
+def test_evidence_file_exists_for_every_closed_ticket(tmp_path, monkeypatch):
+    # Contract: every ticket with a trade.closed journal event gets a
+    # per-trade evidence page. Hermetic: generates from a synthetic
+    # journal into tmp (the earlier live-data version failed on any
+    # fresh checkout, which killed CI on commit 23fad237).
     out = tmp_path / "out"
+    _patched_paths(monkeypatch, tmp_path, _write_synthetic_journal(tmp_path))
     rc = rep.main(["--out", str(out)])
-    assert rc == 0, "privacy gate must pass on real data"
-    tickets = closed_tickets_in_journal()
-    assert tickets, "journal has no closed tickets?"
+    assert rc == 0, "privacy gate must pass on synthetic data"
     pages = md_files_under(str(out))
-    missing = sorted(t for t in tickets if t not in pages)
-    assert not missing, f"no evidence page for closed tickets: {missing}"
+    assert FAKE_TICKET in pages, \
+        f"no evidence page for closed ticket {FAKE_TICKET}"
     pngs = set()
     for root, _, files in os.walk(str(out)):
         for fn in files:
             if fn.endswith(".png"):
                 pngs.add(fn[:-4])
-    missing_png = sorted(t for t in tickets if t not in pngs)
-    assert not missing_png, f"no schematic chart for tickets: {missing_png}"
+    assert FAKE_TICKET in pngs, \
+        f"no schematic chart for closed ticket {FAKE_TICKET}"
 
 
-def test_required_evidence_fields_on_real_pages(tmp_path):
+def test_required_evidence_fields_on_pages(tmp_path, monkeypatch):
+    # Hermetic: required fields must appear on pages generated from a
+    # synthetic journal (the earlier live-data version only passed where
+    # the live broker files happened to exist, which killed CI).
     out = tmp_path / "out"
+    _patched_paths(monkeypatch, tmp_path, _write_synthetic_journal(tmp_path))
     assert rep.main(["--out", str(out)]) == 0
     pages = md_files_under(str(out))
+    assert pages, "no pages generated from synthetic journal"
     required = ["Deal in ID:", "Deal out ID:", "Gross profit:", "Swap:",
                 "Commission:", "Net profit:", "Source: nova_journal.jsonl line",
                 "- Symbol:", "- Direction:", "- Volume:",
                 "- Entry price:", "- Exit price:", "- Entry time:",
                 "- Exit time:", "- Exit reason:", "## Lesson"]
-    unchecked = 0
     for ticket, path in sorted(pages.items()):
         md = open(path, encoding="utf-8").read()
         for field in required:
@@ -90,20 +108,22 @@ def test_required_evidence_fields_on_real_pages(tmp_path):
         # lesson section: either a real lesson ref or the honest absence line
         assert ("- Lesson ref:" in md
                 or "No lesson recorded for this ticket" in md), ticket
-        unchecked += 1
-    assert unchecked > 0
 
 
-def test_every_chart_labeled_schematic_real_data(tmp_path):
+def test_every_chart_labeled_schematic(tmp_path):
     # Behavioral: inspect each generated figure object for the visible
     # schematic label (title / figure text / axis label). No OCR needed.
-    journal = rep.load_jsonl(rep.JOURNAL_PATH)
-    broker = rep.load_jsonl(rep.TRADES_PATH)
-    signals = rep.load_jsonl(rep.SIGNALS_PATH)
+    # Hermetic: synthetic trades, no live broker files.
+    journal = [
+        _synthetic_open(),
+        {"type": "trade.closed", "ticket": int(FAKE_TICKET),
+         "reason": "broker", "time": "2026.09.23 11:00:00",
+         "exit_price": 1.1050, "profit": 100.0, "net_profit": 93.0},
+        _synthetic_open(ticket="99000000012"),
+    ]
     trades, _, pos_by_ticket, snap_time = rep.build_trades(
-        journal, broker, signals, {})
+        journal, [], [], {})
     assert trades
-    checked = 0
     for tr in trades:
         tr["_open_pos"] = pos_by_ticket.get(tr["ticket"])
         tr["_snap_time"] = snap_time
@@ -114,8 +134,6 @@ def test_every_chart_labeled_schematic_real_data(tmp_path):
         texts += [ax.get_xlabel() for ax in fig.axes]
         assert any(rep.SCHEMATIC_LABEL in t for t in texts), tr["ticket"]
         assert os.path.getsize(out) > 0
-        checked += 1
-    assert checked == len(trades)
 
 
 # ---------------------------------------------------------------- unresolved trades: no invented P&L

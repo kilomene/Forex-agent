@@ -19,7 +19,7 @@ from contextlib import redirect_stdout
 import pytest
 
 BRIDGE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SCRIPTS = os.path.join(os.path.dirname(BRIDGE), "scripts")
+SCRIPTS = os.path.join(BRIDGE, "scripts")
 sys.path.insert(0, SCRIPTS)
 sys.path.insert(0, BRIDGE)
 

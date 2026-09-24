@@ -1,9 +1,14 @@
 """Tests for trading_mode.py. No network, no real broker, tmp run dir only."""
 import json
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 
 import pytest
+
+BRIDGE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BRIDGE not in sys.path:
+    sys.path.insert(0, BRIDGE)
 
 import trading_mode as tm
 from trading_mode import (

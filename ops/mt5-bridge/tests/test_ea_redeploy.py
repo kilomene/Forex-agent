@@ -17,7 +17,12 @@ ops/mt5-bridge/docs/ea-redeploy-verification.md.
 """
 import json
 import os
+import sys
 import time
+
+BRIDGE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BRIDGE not in sys.path:
+    sys.path.insert(0, BRIDGE)
 
 import trade_executor as te
 

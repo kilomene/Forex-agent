@@ -1,13 +1,20 @@
 """Issue 7 regression test: kill-switch source-of-truth anchors.
 
-Asserts the documented anchors still parse: the canonical journal
-kill_switch.tripped event (time + tripped_by), the halted
-run/trading_enabled file, and the source-of-truth doc itself.
+Two tiers:
+- Hermetic (run everywhere, incl. CI): the source-of-truth doc anchors
+  and the UTC-by-construction timestamp test.
+- Live-deployment (run only where the trading machine's run/ state
+  exists): the canonical journal kill_switch.tripped event and the
+  halted run/trading_enabled file. These assert THIS machine's safety
+  posture; on a fresh checkout (CI) they skip instead of failing, which
+  is what killed the build on commit 23fad237.
 """
 import json
 import os
 import sys
 from datetime import datetime, timezone
+
+import pytest
 
 BRIDGE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BRIDGE)
@@ -18,6 +25,10 @@ ENABLED = os.path.join(RUN, "trading_enabled")
 DOC = os.path.join(BRIDGE, "docs", "KILL_SWITCH_SOURCE_OF_TRUTH.md")
 
 CANON_TIME = "2026-09-23 21:05:18"  # UTC
+
+needs_run_state = pytest.mark.skipif(
+    not os.path.exists(JOURNAL),
+    reason="live run state not present on this machine (e.g. CI checkout)")
 
 
 def _kill_events():
@@ -36,6 +47,7 @@ def _kill_events():
     return out
 
 
+@needs_run_state
 def test_canonical_kill_event_present():
     evs = _kill_events()
     assert len(evs) >= 1, "no kill_switch.tripped event in journal"
@@ -44,6 +56,7 @@ def test_canonical_kill_event_present():
     assert "parent/main-agent" in ev.get("tripped_by", "")
 
 
+@needs_run_state
 def test_trading_still_halted():
     with open(ENABLED) as f:
         assert f.read().strip() == "0"
