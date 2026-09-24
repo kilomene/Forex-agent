@@ -38,7 +38,7 @@ import json
 import math
 import os
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 
 MODES = ("DEMO", "LIVE")
 
@@ -51,7 +51,9 @@ FIELDS = (
 
 
 def _now_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Repair round 2 (2026-09-24): UTC by construction (see
+    # trade_executor.now_str).
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def state_path(run_dir, mode):

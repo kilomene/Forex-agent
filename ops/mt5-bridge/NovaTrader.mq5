@@ -229,6 +229,22 @@ void SaveCursor(long off)
 //| Seen-ticket persistence (nova_positions_seen.json)                |
 //| Survives EA/terminal restarts: the exit reconciler never loses   |
 //| track of our tickets and never double-reports a close.           |
+//|                                                                  |
+//| 2026-09-23 AUDIT (issues 1+2): the disappearing-ticket mechanism  |
+//| was IN THIS FILE, not a Python writer (no Python code writes     |
+//| nova_positions_seen.json). Two defects: (1) ParseTicketEntry      |
+//| required the exact literal "ticket": -- any whitespace variant   |
+//| failed; (2) Load/Seed loops did `break` on the first parse       |
+//| failure, dropping every later ticket from memory, and the next   |
+//| SaveSeenTickets() (wholesale FILE_WRITE) then permanently        |
+//| deleted them from the file. Fixed: whitespace-tolerant parse     |
+//| via FindJsonValuePos + skip-and-continue on malformed entries.   |
+//| missing_since PRUNE AUDIT: a ticket is untracked only after (a)  |
+//| AlreadyClosedInTradesFile confirms a journaled close, or (b) a   |
+//| real closing deal is found in history, or (c) 24h missing with   |
+//| no closing deal -> an HONEST unknown close (P&L never invented). |
+//| missing_since persists in the file across restarts, so a single  |
+//| missed poll can never trigger pruning. No change needed.         |
 //+------------------------------------------------------------------+
 int SeenIndex(ulong ticket)
 {
@@ -264,17 +280,53 @@ void SaveSeenTickets()
             GetLastError());
 }
 
+// FindJsonValuePos: locate the value of a flat JSON key, tolerating
+// whitespace (space, tab, CR, LF) between the key, the colon, and the
+// value. Returns the index of the first value character, or -1 when the
+// key (followed by a colon) is absent. maxSpan limits how far past
+// startPos the key may begin (-1 = no limit).
+int FindJsonValuePos(const string txt, const string key, int startPos,
+                     int maxSpan)
+{
+   string quoted = "\"" + key + "\"";
+   int p = StringFind(txt, quoted, startPos);
+   if(p < 0) return(-1);
+   if(maxSpan >= 0 && p > startPos + maxSpan) return(-1);
+   int n = StringLen(txt);
+   int q = p + StringLen(quoted);
+   while(q < n)
+   {
+      ushort c = StringGetCharacter(txt, q);
+      if(c == ' ' || c == '\t' || c == '\r' || c == '\n') q++;
+      else break;
+   }
+   if(q >= n || StringGetCharacter(txt, q) != ':') return(-1);
+   q++;
+   while(q < n)
+   {
+      ushort c = StringGetCharacter(txt, q);
+      if(c == ' ' || c == '\t' || c == '\r' || c == '\n') q++;
+      else break;
+   }
+   if(q >= n) return(-1);
+   return(q);
+}
+
 // Parse one flat {"ticket":N,...} entry starting at entryPos for the
 // named fields. Used for both the seen file and nova_positions.json.
+// WHITESPACE-TOLERANT (2026-09-23 fix): "ticket" : 123, tabs, and
+// newlines all parse. Returns false only when no ticket key (followed
+// by a colon) exists near entryPos; a missing optional field just
+// leaves its out-parameter empty, never fails the entry.
 bool ParseTicketEntry(const string txt, int entryPos, ulong &ticket,
                       string &symbol, string &type, double &volume,
                       long &magic)
 {
    ticket = 0; symbol = ""; type = ""; volume = 0; magic = 0;
-   int p = StringFind(txt, "\"ticket\":", entryPos);
-   if(p < 0 || p > entryPos + 600) return(false);
-   p += 9;
-   int n = StringLen(txt), q = p;
+   int n = StringLen(txt);
+   int p = FindJsonValuePos(txt, "ticket", entryPos, 600);
+   if(p < 0) return(false);
+   int q = p;
    while(q < n)
    {
       ushort c = StringGetCharacter(txt, q);
@@ -282,43 +334,43 @@ bool ParseTicketEntry(const string txt, int entryPos, ulong &ticket,
    }
    if(q == p) return(false);
    ticket = (ulong)StringToInteger(StringSubstr(txt, p, q - p));
-   int ps = StringFind(txt, "\"symbol\":\"", p);
-   if(ps >= 0 && ps < p + 600)
+   int ps = FindJsonValuePos(txt, "symbol", p, 600);
+   if(ps >= 0 && ps < n && StringGetCharacter(txt, ps) == '"')
    {
-      ps += 10;
+      ps++;
       int qs = StringFind(txt, "\"", ps);
-      if(qs > ps) symbol = StringSubstr(txt, ps, qs - ps);
+      if(qs > ps && qs < p + 600) symbol = StringSubstr(txt, ps, qs - ps);
    }
-   int pt = StringFind(txt, "\"type\":\"", p);
-   if(pt >= 0 && pt < p + 600)
+   int pt = FindJsonValuePos(txt, "type", p, 600);
+   if(pt >= 0 && pt < n && StringGetCharacter(txt, pt) == '"')
    {
-      pt += 8;
+      pt++;
       int qt = StringFind(txt, "\"", pt);
-      if(qt > pt) type = StringSubstr(txt, pt, qt - pt);
+      if(qt > pt && qt < p + 600) type = StringSubstr(txt, pt, qt - pt);
    }
-   int pv = StringFind(txt, "\"volume\":", p);
-   if(pv >= 0 && pv < p + 600)
+   int pv = FindJsonValuePos(txt, "volume", p, 600);
+   if(pv >= 0)
    {
-      pv += 9;
-      int qv = pv, nn = StringLen(txt);
-      while(qv < nn)
+      int qv = pv;
+      while(qv < n)
       {
          ushort c = StringGetCharacter(txt, qv);
          if((c >= '0' && c <= '9') || c == '.') qv++; else break;
       }
-      if(qv > pv) volume = StringToDouble(StringSubstr(txt, pv, qv - pv));
+      if(qv > pv && qv < p + 600)
+         volume = StringToDouble(StringSubstr(txt, pv, qv - pv));
    }
-   int pm = StringFind(txt, "\"magic\":", p);
-   if(pm >= 0 && pm < p + 600)
+   int pm = FindJsonValuePos(txt, "magic", p, 600);
+   if(pm >= 0)
    {
-      pm += 8;
       int qm = pm;
       while(qm < n)
       {
          ushort c = StringGetCharacter(txt, qm);
          if(c >= '0' && c <= '9') qm++; else break;
       }
-      if(qm > pm) magic = StringToInteger(StringSubstr(txt, pm, qm - pm));
+      if(qm > pm && qm < p + 600)
+         magic = StringToInteger(StringSubstr(txt, pm, qm - pm));
    }
    return(true);
 }
@@ -339,13 +391,31 @@ void LoadSeenTickets()
    ArrayResize(g_seen, 0);
    string txt = ReadWholeFile("nova_positions_seen.json");
    if(StringLen(txt) == 0) return;
-   int pos = 0, loaded = 0;
+   int pos = 0, loaded = 0, skipped = 0;
    while(true)
    {
-      int p = StringFind(txt, "\"ticket\":", pos);
-      if(p < 0) break;
+      // Find the next "ticket" KEY (quoted, so the "tickets":[ wrapper
+      // header never matches), then require a colon after optional
+      // whitespace -- hand-edited or pretty-printed files still load.
+      int keyAt = StringFind(txt, "\"ticket\"", pos);
+      if(keyAt < 0) break;
+      int vpos = FindJsonValuePos(txt, "ticket", keyAt, 0);
+      if(vpos < 0) { pos = keyAt + 8; continue; }
       ulong ticket; string symbol, type; double volume; long magic;
-      if(!ParseTicketEntry(txt, p, ticket, symbol, type, volume, magic)) break;
+      if(!ParseTicketEntry(txt, keyAt, ticket, symbol, type, volume, magic))
+      {
+         // 2026-09-23 fix: NEVER break here. One malformed entry used to
+         // abort the whole load, and the next SaveSeenTickets() then
+         // permanently dropped every later ticket from the file -- the
+         // silent mass-loss mechanism. Skip it, log it, keep loading.
+         Print("NovaTrader: LoadSeenTickets skipping malformed entry at ",
+               keyAt, ": ",
+               StringSubstr(txt, keyAt,
+                            MathMin(80, StringLen(txt) - keyAt)));
+         skipped++;
+         pos = keyAt + 8;
+         continue;
+      }
       if(ticket > 0 && SeenIndex(ticket) < 0)
       {
          int k = ArraySize(g_seen);
@@ -356,10 +426,9 @@ void LoadSeenTickets()
          g_seen[k].volume = volume;
          g_seen[k].tracked_at = TimeGMT();
          g_seen[k].missing_since = 0;
-         int pms = StringFind(txt, "\"missing_since\":", p);
-         if(pms >= 0 && pms < p + 600)
+         int pms = FindJsonValuePos(txt, "missing_since", keyAt, 600);
+         if(pms >= 0)
          {
-            pms += 16;
             int qms = pms, nn = StringLen(txt);
             while(qms < nn)
             {
@@ -372,10 +441,11 @@ void LoadSeenTickets()
          }
          loaded++;
       }
-      pos = p + 9;
+      pos = vpos + 1;
    }
-   if(loaded > 0)
-      Print("NovaTrader: loaded ", loaded, " seen tickets from nova_positions_seen.json");
+   if(loaded > 0 || skipped > 0)
+      Print("NovaTrader: loaded ", loaded, " seen tickets from ",
+            "nova_positions_seen.json (skipped ", skipped, " malformed)");
 }
 
 // Seed the seen set from the last published nova_positions.json so a
@@ -388,10 +458,19 @@ void SeedFromPublishedPositions()
    int pos = 0, added = 0;
    while(true)
    {
-      int p = StringFind(txt, "\"ticket\":", pos);
-      if(p < 0) break;
+      int keyAt = StringFind(txt, "\"ticket\"", pos);
+      if(keyAt < 0) break;
+      int vpos = FindJsonValuePos(txt, "ticket", keyAt, 0);
+      if(vpos < 0) { pos = keyAt + 8; continue; }
       ulong ticket; string symbol, type; double volume; long magic;
-      if(!ParseTicketEntry(txt, p, ticket, symbol, type, volume, magic)) break;
+      if(!ParseTicketEntry(txt, keyAt, ticket, symbol, type, volume, magic))
+      {
+         // Same mass-loss guard as LoadSeenTickets: skip, log, continue.
+         Print("NovaTrader: SeedFromPublishedPositions skipping malformed ",
+               "entry at ", keyAt);
+         pos = keyAt + 8;
+         continue;
+      }
       if(ticket > 0 && magic == InMagic && SeenIndex(ticket) < 0)
       {
          int k = ArraySize(g_seen);
@@ -404,7 +483,7 @@ void SeedFromPublishedPositions()
          g_seen[k].missing_since = 0;
          added++;
       }
-      pos = p + 9;
+      pos = vpos + 1;
    }
    if(added > 0)
    {

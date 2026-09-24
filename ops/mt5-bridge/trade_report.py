@@ -39,10 +39,13 @@ signal's entry/SL/TP/exit parameters. The image itself visibly carries the
 exact text "schematic -- reconstructed from signal parameters". Schematic
 images are never described as historical candle charts.
 
-SANITIZED + PRIVACY-GATED: account logins, deal/order IDs, tokens and other
-private identifiers are never written into the docs, and every run ends
-with a fail-on-match privacy scan over all generated .md and .png files
-(text + PNG metadata). Any match fails the run with a non-zero exit.
+SANITIZED + PRIVACY-GATED: account logins, tokens and other private
+identifiers are never written into the docs. A trade's OWN broker
+identifiers (its position ticket, deal_in/deal_out IDs, order and position
+IDs) ARE shown on that trade's own page -- they are the evidence's source
+keys. Every run ends with a fail-on-match privacy scan over all generated
+.md and .png files (text + PNG metadata): identifiers NOT belonging to the
+trade in that file fail the run with a non-zero exit.
 
 Usage:
     python3 trade_report.py [--out DIR]
@@ -72,6 +75,8 @@ JOURNAL_PATH = os.path.join(BASE, "run", "nova_journal.jsonl")
 TRADES_PATH = os.path.join(FILES_DIR, "nova_trades.jsonl")
 SIGNALS_PATH = os.path.join(FILES_DIR, "nova_signals.jsonl")
 POSITIONS_PATH = os.path.join(FILES_DIR, "nova_positions.json")
+# Live lessons DB: lessons.ref is the position ticket (as text).
+LESSONS_DB = os.path.join(BASE, "..", "data", "trade_learning.db")
 DEFAULT_OUT = "/home/hatch/workspace/mt5/evidence-docs/docs/trades"
 
 SERVER_TZ_NOTE = "MT5 server time (UTC+3)"
@@ -85,17 +90,45 @@ def load_jsonl(path):
     rows = []
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
-            for line in f:
+            for ln, line in enumerate(f, 1):
                 line = line.strip()
                 if not line:
                     continue
                 try:
-                    rows.append(json.loads(line))
+                    e = json.loads(line)
                 except ValueError:
                     continue
+                if isinstance(e, dict):
+                    # Evidence source ref: the journal line this event came
+                    # from. Shown on each trade page ("Source: ...").
+                    e["_line"] = ln
+                rows.append(e)
     except OSError:
         pass
     return rows
+
+
+def load_lessons(db_path=LESSONS_DB):
+    """Load trade lessons keyed by ticket text. Never raises: an absent or
+    unreadable DB simply yields no lessons."""
+    lessons = {}
+    try:
+        import sqlite3
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        for row in conn.execute(
+                "SELECT ref, kind, why_entered, why_exited, what_worked, "
+                "what_failed, what_to_change, author, created_at FROM lessons"):
+            ref = str(row[0]).strip()
+            lessons[ref] = {
+                "ref": ref, "kind": row[1], "why_entered": row[2],
+                "why_exited": row[3], "what_worked": row[4],
+                "what_failed": row[5], "what_to_change": row[6],
+                "author": row[7], "created_at": row[8],
+            }
+        conn.close()
+    except Exception:
+        pass
+    return lessons
 
 
 def parse_server_time(s):
@@ -150,7 +183,25 @@ def build_trades(journal, broker_trades, signals, positions):
         if t not in opens:
             opens[t] = dict(e)
             opens[t]["_source"] = source
+            opens[t]["_open_line"] = e.get("_line")
             opens_order.append(t)
+
+    def note_close(e):
+        ticket = e.get("ticket")
+        if not ticket:
+            return
+        if ticket in closes:
+            closes[ticket].setdefault("_close_lines", [])
+            if e.get("_line") is not None:
+                closes[ticket]["_close_lines"].append(e.get("_line"))
+            # last event wins for the record itself (existing behavior)
+            closes[ticket].update({k: v for k, v in e.items()
+                                   if k != "_close_lines"})
+        else:
+            closes[ticket] = e
+            closes[ticket].setdefault("_close_lines", [])
+            if e.get("_line") is not None:
+                closes[ticket]["_close_lines"].append(e.get("_line"))
 
     for e in journal:
         t = e.get("type")
@@ -162,7 +213,7 @@ def build_trades(journal, broker_trades, signals, positions):
         elif t == "trade.opened":
             note_open(e, "journal")
         elif t == "trade.closed":
-            closes[e.get("ticket")] = e
+            note_close(e)
         elif t == "trade.close_corrected" and e.get("ticket") is not None:
             corrections[e["ticket"]] = e
     for e in broker_trades:  # broker-side feed; journal wins on conflict,
@@ -174,9 +225,13 @@ def build_trades(journal, broker_trades, signals, positions):
             ticket = e.get("ticket")
             if ticket in closes:
                 for k, v in e.items():
-                    closes[ticket].setdefault(k, v)
+                    if k != "_line":
+                        closes[ticket].setdefault(k, v)
             else:
                 closes[ticket] = e
+                closes[ticket].setdefault("_close_lines", [])
+                if e.get("_line") is not None:
+                    closes[ticket]["_close_lines"].append(e.get("_line"))
         elif t == "trade.close_corrected" and e.get("ticket") is not None:
             corrections[e["ticket"]] = e
     # Authoritative revisions (QueryClose reconciliation) overlay the
@@ -195,6 +250,8 @@ def build_trades(journal, broker_trades, signals, positions):
             if corr.get(k) is not None:
                 merged[k] = corr[k]
         merged["corrected_from_provisional"] = True
+        if corr.get("_line") is not None:
+            merged["_correction_line"] = corr.get("_line")
         closes[ticket] = merged
 
     trades = []
@@ -220,6 +277,9 @@ def build_trades(journal, broker_trades, signals, positions):
             "decision": decisions.get(sid),
             "close": close,
             "open_source": o.get("_source"),
+            "_open_line": o.get("_open_line"),
+            "_close_lines": (close or {}).get("_close_lines") or [],
+            "_correction_line": (close or {}).get("_correction_line"),
         })
     pos_by_ticket = {}
     snap_time = None
@@ -697,7 +757,7 @@ def signal_block(tr):
     return f"strategy `{strat}`: {trig}{more}"
 
 
-def trade_page(tr, overrides, pos_by_ticket, snap_time):
+def trade_page(tr, overrides, pos_by_ticket, snap_time, lessons=None):
     c = tr["close"] or {}
     pos = pos_by_ticket.get(tr["ticket"])
     tr["_open_pos"] = pos
@@ -719,6 +779,50 @@ def trade_page(tr, overrides, pos_by_ticket, snap_time):
     entry_dt = parse_server_time(tr["entry_time"])
     day = entry_dt.strftime("%Y-%m-%d") if entry_dt else "unknown-date"
 
+    # ---- evidence identity/cost fields (recorded values only) ----
+    deal_in = c.get("deal_in")
+    deal_out = c.get("deal_out")
+    broker_refs = [x for x in (c.get("deal_id"), c.get("order_id"),
+                               c.get("position_id")) if x]
+    gross = _num(c.get("gross_profit"))
+    swap_v = _num(c.get("swap"))
+    comm_v = _num(c.get("commission"))
+    net_v = _num(c.get("net_profit"))
+    gross_txt = fmt_money(gross) if gross is not None else "not recorded"
+    swap_txt = fmt_money(swap_v) if swap_v is not None else "not recorded"
+    comm_txt = fmt_money(comm_v) if comm_v is not None else "not recorded"
+    net_txt = fmt_money(net_v) if net_v is not None else "not recorded"
+
+    src_parts = []
+    if tr.get("_open_line") is not None:
+        src_parts.append(f"nova_journal.jsonl line {tr['_open_line']} (open)")
+    for ln in tr.get("_close_lines") or []:
+        src_parts.append(f"nova_journal.jsonl line {ln} (close)")
+    if tr.get("_correction_line") is not None:
+        src_parts.append(
+            f"nova_journal.jsonl line {tr['_correction_line']} (close_corrected)")
+    if tr.get("open_source") == "broker-feed":
+        src_parts.append("nova_trades.jsonl (broker feed)")
+    source_txt = "; ".join(src_parts) if src_parts else "not recorded"
+
+    lesson = (lessons or {}).get(str(tr["ticket"]))
+    lesson_lines = ["## Lesson", ""]
+    if lesson:
+        lesson_lines += [
+            f"- Lesson ref: {sanitize_note(lesson['ref'])} (kind: "
+            f"{lesson['kind'] or 'trade'}, recorded "
+            f"{lesson['created_at'] or 'not recorded'} "
+            f"by {lesson['author'] or 'unknown'})",
+            f"- Why entered: {sanitize_note(lesson['why_entered'] or '') or 'not recorded'}",
+            f"- Why exited: {sanitize_note(lesson['why_exited'] or '') or 'not recorded'}",
+            f"- What worked: {sanitize_note(lesson['what_worked'] or '') or 'not recorded'}",
+            f"- What failed: {sanitize_note(lesson['what_failed'] or '') or 'not recorded'}",
+            f"- What to change: {sanitize_note(lesson['what_to_change'] or '') or 'not recorded'}",
+        ]
+    else:
+        lesson_lines.append(
+            "- No lesson recorded for this ticket in trade_learning.db.")
+
     lines = [
         f"# {tr['symbol']} {tr['direction']} -- ticket {tr['ticket']}",
         "",
@@ -737,10 +841,19 @@ def trade_page(tr, overrides, pos_by_ticket, snap_time):
         f"- Stop-loss: {fmt(tr['stop_loss'])}",
         f"- Take-profit: {fmt(tr['take_profit'])}",
         f"- Volume: {fmt(tr['volume'], 2)} lots",
+        f"- Deal in ID: {deal_in if deal_in else 'not recorded'}",
+        f"- Deal out ID: {deal_out if deal_out else 'not recorded'}",
+        *( [f"- Broker refs: {', '.join(str(x) for x in broker_refs)}"]
+           if broker_refs else [] ),
         f"- P&L: {pnl_line(tr, cls)}",
+        f"- Gross profit: {gross_txt}",
+        f"- Swap: {swap_txt}",
+        f"- Commission: {comm_txt}",
+        f"- Net profit: {net_txt}",
         f"- Floating P&L: {(fmt_money(pos.get('profit')) + ' (unrealized, snapshot ' + str(snap_time) + ')') if pos else 'not recorded'}",
         f"- Commission / swap: {comm_swap}",
         f"- Exit reason: {exit_reason_text(c) if c else ('still open' if pos else 'not recorded')}",
+        f"- Source: {source_txt}",
         f"- Market session at entry: {session_label(entry_dt)}",
         "",
         "## Signal rationale",
@@ -750,6 +863,8 @@ def trade_page(tr, overrides, pos_by_ticket, snap_time):
         "## Gate decision record",
         "",
         decision_block(tr),
+        "",
+        *lesson_lines,
         "",
         WHY_HEADING[cls],
         "",
@@ -988,8 +1103,13 @@ def file_allowed_ids(path, extra=()):
     return ids
 
 
-def run_privacy_scan(out_dir, index_extra_ids=()):
-    """Walk out_dir scanning every .md/.png. Returns the violation list."""
+def run_privacy_scan(out_dir, index_extra_ids=(), extra_by_file=None):
+    """Walk out_dir scanning every .md/.png. Returns the violation list.
+
+    extra_by_file maps a file's basename (e.g. "10605494223.md") to a set of
+    identifiers that legitimately appear in that file (the trade's own deal
+    / order / position IDs, shown as evidence fields on its own page)."""
+    extra_by_file = extra_by_file or {}
     violations = []
     scanned = 0
     for root, _, files in os.walk(out_dir):
@@ -998,6 +1118,7 @@ def run_privacy_scan(out_dir, index_extra_ids=()):
                 continue
             path = os.path.join(root, fn)
             allowed = file_allowed_ids(path)
+            allowed |= set(str(x) for x in extra_by_file.get(fn, ()))
             if fn == "index.md":
                 allowed |= set(str(x) for x in index_extra_ids)
             violations.extend(scan_evidence_file(path, allowed))
@@ -1008,20 +1129,26 @@ def run_privacy_scan(out_dir, index_extra_ids=()):
 # ---------------------------------------------------------------- main
 
 def own_ids(tr):
-    """The trade's own identifiers (ticket, signal/command IDs) that are
-    expected to appear in its evidence files."""
+    """The trade's own identifiers (ticket, deal_in/deal_out/order/position
+    IDs, signal/command IDs) that are expected to appear in its evidence
+    files. These are allowlisted for the trade's own page by the privacy
+    scan; identifiers NOT belonging to the trade still fail the run."""
     ids = set()
     sig = tr.get("signal") or {}
+    c = tr.get("close") or {}
     for v in (tr.get("ticket"), tr.get("signal_id"), tr.get("command_id"),
-              sig.get("signal_id"), sig.get("id")):
+              sig.get("signal_id"), sig.get("id"),
+              c.get("deal_in"), c.get("deal_out"), c.get("deal_id"),
+              c.get("deal_entry"), c.get("order_id"), c.get("position_id")):
         if v:
             ids.update(re.findall(r"\d+", str(v)))
     return ids
 
 
-def generate(out_dir, journal, broker_trades, signals, positions):
+def generate(out_dir, journal, broker_trades, signals, positions, lessons=None):
     trades, overrides, pos_by_ticket, snap_time = build_trades(
         journal, broker_trades, signals, positions)
+    lessons = lessons if lessons is not None else {}
     print(f"trades found: {len(trades)} "
           f"({sum(1 for t in trades if t['close'])} closed, "
           f"{sum(1 for t in trades if not t['close'] and t['ticket'] not in pos_by_ticket)} "
@@ -1030,13 +1157,25 @@ def generate(out_dir, journal, broker_trades, signals, positions):
           f"still open)")
 
     pages = []
+    extra_by_file = {}
+    # Every trade ticket in this report is published in index.md, so a
+    # per-trade page (e.g. its lesson) may legitimately reference a sibling
+    # trade's ticket. Deal/order/position IDs stay restricted to their own
+    # trade's page.
+    report_tickets = set(str(tr["ticket"]) for tr in trades)
     for tr in trades:
-        md, day = trade_page(tr, overrides, pos_by_ticket, snap_time)
+        md, day = trade_page(tr, overrides, pos_by_ticket, snap_time, lessons)
         day_dir = os.path.join(out_dir, day)
         os.makedirs(day_dir, exist_ok=True)
         with open(os.path.join(day_dir, f"{tr['ticket']}.md"), "w") as f:
             f.write(md + "\n")
         draw_schematic(tr, os.path.join(day_dir, f"{tr['ticket']}.png"))
+        # The trade's own broker identifiers (deal_in/deal_out/order/position
+        # IDs) are shown as evidence fields on its own page; allowlist them
+        # for that file only.
+        extras = own_ids(tr) | report_tickets
+        extra_by_file[f"{tr['ticket']}.md"] = extras
+        extra_by_file[f"{tr['ticket']}.png"] = extras
         cls = classify_outcome(tr)
         pnl = close_net(tr["close"])
         pos = pos_by_ticket.get(tr["ticket"])
@@ -1066,7 +1205,8 @@ def generate(out_dir, journal, broker_trades, signals, positions):
     index_extra = set()
     for tr in trades:
         index_extra.update(own_ids(tr))
-    violations, scanned = run_privacy_scan(out_dir, index_extra)
+    violations, scanned = run_privacy_scan(out_dir, index_extra,
+                                           extra_by_file=extra_by_file)
     if violations:
         print("PRIVACY CHECK FAILED -- refusing to publish evidence:",
               file=sys.stderr)
@@ -1092,8 +1232,10 @@ def main(argv=None):
             positions = json.load(f)
     except (OSError, ValueError):
         positions = {}
+    lessons = load_lessons()
 
-    result = generate(args.out, journal, broker_trades, signals, positions)
+    result = generate(args.out, journal, broker_trades, signals, positions,
+                      lessons)
     return 1 if result["violations"] else 0
 
 

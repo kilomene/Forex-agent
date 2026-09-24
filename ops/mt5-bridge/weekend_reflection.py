@@ -16,7 +16,7 @@ import json
 import os
 import sys
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 STATE_DIR = os.environ.get("TRADER_STATE_DIR", os.path.join(BASE, "run"))
@@ -125,7 +125,7 @@ def main():
         "by_weekday": {k: stats(v) for k, v in sorted(by_weekday.items())},
         "longest_win_streak": best_win,
         "longest_loss_streak": worst_loss,
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
     }
     with open(JOURNAL_PATH, "a") as f:
         f.write(json.dumps(reflection) + "\n")

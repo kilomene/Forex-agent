@@ -232,9 +232,9 @@ def test_advise_pipeline_error_abstains():
 
 
 # ---------------------------------------------------------------- wiring
-# The advisory call in the signal path is ADDITIVE ONLY: it journals
-# ai.decision and never changes the gate decision unless the operator
-# explicitly enables ai_veto_enabled.
+# The advisory call in the signal path journals ai.decision and ALWAYS
+# enforces the veto (fail-closed): an honest NO_TRADE vetoes a commanded
+# signal. The only way through is a one-shot founder approval file.
 
 import json as _json  # noqa: E402
 import os as _os  # noqa: E402
@@ -278,28 +278,188 @@ def test_advisory_is_additive_by_default(tmp_path):
     assert _os.path.getsize(_os.path.join(files, "nova_commands.jsonl")) == 0
 
 
-def test_veto_blocks_commanded_only_when_enabled(tmp_path):
+def test_veto_blocks_commanded_by_default(tmp_path):
+    # Repair round 2 (2026-09-24): the advisory veto is ALWAYS enforced,
+    # fail-closed. The old ai_veto_enabled opt-in is gone: with it off
+    # (the default), an honest AI NO_TRADE was silently overridden and
+    # commanded anyway (EURDKK 2026-09-23, -$117.73). Default config, no
+    # approval file -> the abstention vetoes the trade.
     eng, cfg, specs, sig, run, files = _wiring_sandbox(tmp_path)
     cfg.update({"trading_enabled": True, "dry_run": False,
-                "capital_basis": 200000.0, "ai_veto_enabled": True})
+                "capital_basis": 200000.0})
+    assert "ai_veto_enabled" not in cfg  # the opt-in no longer exists
     # No indicator data -> the honest AI abstains (NO_TRADE) -> veto.
     d = eng.handle_signal(sig, cfg, True, specs, True, {}, 0.0,
                           "2026-09-23", market_open=True)
-    assert d == "skipped:ai_veto"
+    assert d == "skipped:advisory_no_trade", d
+    assert d != "commanded"  # a vetoed signal writes no command
     assert _os.path.getsize(_os.path.join(files, "nova_commands.jsonl")) == 0
     types = _journal_types(run)
     assert "ai.decision" in types
     assert "trade.decision" in types
 
 
-def test_veto_never_forces_a_trade(tmp_path):
-    # A signal the gates refuse stays refused even with veto enabled;
-    # the AI can only ever remove a trade, never create one.
+def test_veto_override_requires_one_shot_founder_file(tmp_path):
+    # The ONLY way through a veto is an explicit, one-shot founder
+    # approval file: run/ai_override_<signal_id> holding a non-empty ref.
+    # It is consumed on first use and journaled as {"type": "ai.override"}.
     eng, cfg, specs, sig, run, files = _wiring_sandbox(tmp_path)
     cfg.update({"trading_enabled": True, "dry_run": False,
-                "capital_basis": 200000.0, "ai_veto_enabled": True})
+                "capital_basis": 200000.0})
+    appr_path = _os.path.join(run, "ai_override_X1")
+    with open(appr_path, "w") as f:
+        f.write("founder:2026-09-24:manual-review")
+    d = eng.handle_signal(sig, cfg, True, specs, True, {}, 0.0,
+                          "2026-09-23", market_open=True)
+    assert d == "commanded", d
+    assert not _os.path.exists(appr_path)  # consumed: cannot linger
+    types = _journal_types(run)
+    assert "ai.override" in types
+
+
+def test_veto_override_file_single_use(tmp_path):
+    # A consumed approval cannot be reused: the second signal with the
+    # same id is vetoed again (the file is gone).
+    eng, cfg, specs, sig, run, files = _wiring_sandbox(tmp_path)
+    cfg.update({"trading_enabled": True, "dry_run": False,
+                "capital_basis": 200000.0})
+    with open(_os.path.join(run, "ai_override_X1"), "w") as f:
+        f.write("founder:one-shot")
+    d1 = eng.handle_signal(sig, cfg, True, specs, True, {}, 0.0,
+                           "2026-09-23", market_open=True)
+    assert d1 == "commanded", d1
+    d2 = eng.handle_signal(sig, cfg, True, specs, True, {}, 0.0,
+                           "2026-09-23", market_open=True)
+    assert d2 == "skipped:advisory_no_trade", d2
+
+
+def test_veto_empty_approval_file_is_no_approval(tmp_path):
+    # An empty approval file is not an approval.
+    eng, cfg, specs, sig, run, files = _wiring_sandbox(tmp_path)
+    cfg.update({"trading_enabled": True, "dry_run": False,
+                "capital_basis": 200000.0})
+    with open(_os.path.join(run, "ai_override_X1"), "w") as f:
+        f.write("   ")
+    d = eng.handle_signal(sig, cfg, True, specs, True, {}, 0.0,
+                          "2026-09-23", market_open=True)
+    assert d == "skipped:advisory_no_trade", d
+
+
+def test_veto_never_forces_a_trade(tmp_path):
+    # A signal the gates refuse stays refused; the AI can only ever
+    # remove a trade, never create one.
+    eng, cfg, specs, sig, run, files = _wiring_sandbox(tmp_path)
+    cfg.update({"trading_enabled": True, "dry_run": False,
+                "capital_basis": 200000.0})
     sig = dict(sig, stop_loss=None)  # gate refuses: missing SL
     d = eng.handle_signal(sig, cfg, True, specs, True, {}, 0.0,
                           "2026-09-23", market_open=True)
     assert d == "skipped:missing_sl_tp"
     assert _os.path.getsize(_os.path.join(files, "nova_commands.jsonl")) == 0
+
+
+# ---------------------------------------------------------------- hard advisory veto
+# Track 5 (2026-09-23): an advisory NO_TRADE must never be silently
+# overridden. Regression for the EURDKK incident (signal
+# EURDKK_M15_BUY_1790176500): ai.decision recorded NO_TRADE / confidence
+# 0.0, yet the executor commanded the trade anyway (fill, then closed
+# -$117.73) because the veto was opt-in and off.
+
+
+def _eurdkk_signal():
+    # Shape of the real EURDKK signal: the executor forwards no indicator
+    # data to the engine (only spread/session), so the honest engine
+    # abstains with 0.0 confidence -- exactly the journaled record.
+    return {"id": "EURDKK_M15_BUY_1790176500", "symbol": "EURDKK",
+            "direction": "BUY", "entry_price": 7.4755,
+            "stop_loss": 7.47483, "take_profit": 7.47683,
+            "timeframe": "M15", "rsi": 64.1, "atr": 0.00044}
+
+
+def test_hard_veto_no_trade_blocks_commanded_signal():
+    ae.clear_advisory_records()
+    sig = _eurdkk_signal()
+    advisory = ae.advise(sig, {"spread_points": 12, "session": "newyork"})
+    assert advisory["decision"].decision == "NO_TRADE"
+    assert advisory["decision"].confidence == 0.0
+    assert advisory["valid"] is True
+    ae.record_advisory(sig["id"], advisory)
+    decision, reason = ae.apply_advisory_veto(sig["id"], "commanded")
+    assert decision == "skipped:advisory_no_trade", reason
+    assert decision != "commanded"  # a skipped signal writes no command
+    allowed, why = ae.advisory_allows_trade(sig["id"])
+    assert allowed is False
+    assert why.startswith("advisory_no_trade")
+
+
+def test_hard_veto_missing_record_fails_closed():
+    ae.clear_advisory_records()
+    decision, reason = ae.apply_advisory_veto("no_such_signal", "commanded")
+    assert decision == "skipped:advisory_unavailable", reason
+
+
+def test_hard_veto_none_advisory_fails_closed():
+    ae.clear_advisory_records()
+    ae.record_advisory("sig_x", None)  # engine call failed / raised
+    decision, reason = ae.apply_advisory_veto("sig_x", "commanded")
+    assert decision.startswith("skipped:advisory_"), reason
+    assert decision != "commanded"
+
+
+def test_hard_veto_invalid_trade_advisory_fails_closed():
+    ae.clear_advisory_records()
+    sig = _eurdkk_signal()
+    advisory = ae.advise(sig, {"spread_points": 12, "session": "newyork"})
+    advisory = dict(advisory, valid=False,
+                    validation_errors=["tampered"])
+    ae.record_advisory(sig["id"], advisory)
+    decision, reason = ae.apply_advisory_veto(sig["id"], "commanded")
+    assert decision != "commanded", reason
+
+
+def test_hard_veto_override_requires_explicit_approval():
+    ae.clear_advisory_records()
+    sig = _eurdkk_signal()
+    ae.record_advisory(sig["id"], ae.advise(sig, {}))
+    # Default: no approval -> blocked.
+    d, _ = ae.apply_advisory_veto(sig["id"], "commanded")
+    assert d == "skipped:advisory_no_trade"
+    # Empty / garbage approval -> still blocked.
+    for bad in (None, {}, {"ref": ""}, " ", 0):
+        d, _ = ae.apply_advisory_veto(sig["id"], "commanded",
+                                      operator_approval=bad)
+        assert d == "skipped:advisory_no_trade", bad
+    # Explicit approval -> allowed; the ref is carried in the reason so
+    # the caller can journal it as {"type": "ai.override"}.
+    d, reason = ae.apply_advisory_veto(
+        sig["id"], "commanded",
+        operator_approval={"by": "zenas", "ref": "op-20260923-001",
+                           "reason": "manual review"})
+    assert d == "commanded", reason
+    assert "op-20260923-001" in reason
+
+
+def test_hard_veto_never_forces_a_refused_trade():
+    ae.clear_advisory_records()
+    sig = _eurdkk_signal()
+    ae.record_advisory(sig["id"], ae.advise(sig, {}))
+    d, reason = ae.apply_advisory_veto(
+        sig["id"], "skipped:spread_too_wide",
+        operator_approval={"by": "zenas", "ref": "op-1"})
+    assert d == "skipped:spread_too_wide", reason
+
+
+def test_hard_veto_validated_trade_advisory_allows():
+    ae.clear_advisory_records()
+    sig = dict(_eurdkk_signal(), id="OK_M15_BUY_1")
+    ctx = {"spread_points": 10, "session": "london",
+           "indicators": {"ema_fast": 1.10, "ema_slow": 1.09,
+                          "rsi": 55.0, "atr": 0.001}}
+    advisory = ae.advise(sig, ctx)
+    assert advisory["decision"].decision == "TRADE", \
+        advisory["decision"].thesis
+    assert advisory["valid"] is True
+    ae.record_advisory(sig["id"], advisory)
+    d, reason = ae.apply_advisory_veto(sig["id"], "commanded")
+    assert d == "commanded", reason
+    assert reason == "advisory_ok"

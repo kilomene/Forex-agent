@@ -23,6 +23,13 @@ RUN_DIR = os.path.join(BASE, "run")
 os.makedirs(RUN_DIR, exist_ok=True)
 LOG = os.path.join(RUN_DIR, "supervisor.log")
 
+# EA-owned files live under the MT5 Files dir (same default the executor
+# uses). Kept as a local constant so this supervisor never imports the
+# executor module -- a broken trade_executor.py must not be able to take
+# down daemon supervision.
+FILES_DIR = os.path.expanduser(
+    "~/workspace/mt5/prefix/drive_c/Program Files/MetaTrader 5/MQL5/Files")
+
 DAEMONS = ("trade_executor.py", "signal_bridge.py", "tg_subscribers.py")
 
 
@@ -48,6 +55,43 @@ def alive(script):
         return False
 
 
+def audit_seen_tickets(files_dir=FILES_DIR, run_dir=RUN_DIR):
+    """Read-only 5-minute audit of the EA-owned nova_positions_seen.json.
+
+    Calls ticket_tracker.audit_seen_file() and logs SEEN-AUDIT lines.
+    Never writes the EA file, the trades file, or the journal -- findings
+    are LOUD in the supervisor log; journaling them is deferred to a
+    Zenas-authorized restart (see ticket_tracker docstring).
+    """
+    try:
+        import ticket_tracker
+    except Exception as e:
+        log(f"seen-audit: SKIPPED (import failed: {e})")
+        return
+    seen = os.path.join(files_dir, "nova_positions_seen.json")
+    trades = os.path.join(files_dir, "nova_trades.jsonl")
+    journal = os.path.join(run_dir, "nova_journal.jsonl")
+    try:
+        rep = ticket_tracker.audit_seen_file(seen, trades, journal)
+    except Exception as e:
+        log(f"seen-audit: ERROR {e}")
+        return
+    parsed, verify = rep["parsed"], rep["verify"]
+    hist = rep["history"]
+    if verify["ok"] and not parsed["corrupt"]:
+        log(f"seen-audit: OK "
+            f"(seen={len(parsed['tickets'])} "
+            f"tickets, open={len(hist['open_tickets'])}, "
+            f"closed={len(hist['closed_tickets'])})")
+        return
+    log(f"seen-audit: !!! FINDING ok={verify['ok']} "
+        f"corrupt_spans={verify['corrupt_spans']} "
+        f"untracked_open={verify.get('untracked_open')} "
+        f"tracked_but_closed={verify.get('tracked_but_closed')} "
+        f"duplicate_tickets={verify.get('duplicate_tickets')} "
+        f"phantoms={hist['phantoms']} mirror_gaps={hist['mirror_gaps']}")
+
+
 def main():
     relaunched = []
     for script in DAEMONS:
@@ -68,6 +112,9 @@ def main():
         log(f"relaunched: {', '.join(relaunched)}")
     else:
         log("all daemons alive")
+    # Repair round 2 (2026-09-24): the seen-file watchdog finally has a
+    # production caller. Read-only; findings go to this log.
+    audit_seen_tickets()
     return 0
 
 

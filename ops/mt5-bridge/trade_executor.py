@@ -136,10 +136,14 @@ DEFAULT_CONFIG = {
                                    # (missing/0/negative/NaN/inf) makes
                                    # effective_risk_basis() return None and
                                    # decisions skip 'risk_basis_unavailable'.
-    "ai_veto_enabled": False,      # Worker C 2026-09-23: AI advisory veto.
-                                   # False = advisory only (zero behavior
-                                   # change). True lets a validated AI
-                                   # NO_TRADE veto a commanded signal.
+                                   # NOTE (repair round 2, 2026-09-24): the
+                                   # old ai_veto_enabled opt-in was removed.
+                                   # The advisory veto is now always
+                                   # enforced (fail-closed); a stale
+                                   # ai_veto_enabled key in risk_config.json
+                                   # is ignored. The only override is a
+                                   # one-shot run/ai_override_<signal_id>
+                                   # founder approval file.
     "emergency_drawdown_pct": 3.0, # Worker C 2026-09-23: per-mode emergency
                                    # drawdown that trips the kill switch.
 }
@@ -267,7 +271,7 @@ def audit_safety(run_dir, event, actor, details=None):
         "type": "safety.audit",
         "event": event,
         "actor": actor,
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "time": now_str(),
         "details": details or {},
     }
     try:
@@ -428,7 +432,12 @@ def resolve_paths(files_dir=None, state_dir=None, signals_file=None):
 # ---------------------------------------------------------------- helpers
 
 def now_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Repair round 2 (2026-09-24): journal/log timestamps are UTC by
+    # CONSTRUCTION, not by host accident. datetime.now(timezone.utc)
+    # keeps the "%Y-%m-%d %H:%M:%S" format every reader already parses,
+    # so the kill-switch "UTC canonical source" claim holds on any host
+    # timezone instead of silently breaking on a TZ change.
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def log(msg):
@@ -1337,12 +1346,15 @@ class TraderEngine:
         return self._mode_state
 
     def _ai_advise(self, sig, specs, decision, cfg):
-        """Advisory AI call: journals {"type": "ai.decision"}.
+        """Advisory AI call: journals {"type": "ai.decision"} and records
+        the advisory in ai_engine's registry.
 
-        ADDITIVE ONLY: never raises, never forces a trade. Returns the
-        advisory dict (or None). A veto is applied by the caller only when
-        config ai_veto_enabled is true (default false = zero behavior
-        change for the demo experiment).
+        The advisory is ALWAYS consulted by the caller via
+        ai_engine.apply_advisory_veto() (fail-closed): a missing record,
+        a failed engine call, an invalid advisory, or an honest NO_TRADE
+        all veto a "commanded" signal. The only way through a veto is a
+        one-shot founder approval (see _consume_ai_override). Never
+        raises; returns the advisory dict (or None).
         """
         try:
             import ai_engine
@@ -1372,8 +1384,18 @@ class TraderEngine:
                 "ml_status": advisory["ml_status"],
                 "mode": self._mode_name or "DEMO",
             })
+            # Record for the veto consult below. The registry is the
+            # fail-closed source of truth: apply_advisory_veto() reads it,
+            # never this return value.
+            ai_engine.record_advisory(sig.get("id"), advisory)
             return advisory
         except Exception as e:
+            try:
+                # Engine call failed: record the fail-closed NO_TRADE so
+                # the veto consult below blocks instead of passing blind.
+                ai_engine.record_advisory(sig.get("id"), None)
+            except Exception:
+                pass
             try:
                 self.journal({"type": "ai.error",
                               "signal_id": sig.get("id"),
@@ -1382,6 +1404,45 @@ class TraderEngine:
                 pass
             log(f"warning: ai advisory failed (non-blocking): {e}")
             return None
+
+    def _consume_ai_override(self, signal_id):
+        """One-shot founder approval to override the advisory veto.
+
+        The founder grants it by writing a non-empty ref string to
+        ``run/ai_override_<signal_id>`` (e.g. ``echo
+        "founder:2026-09-24:manual-review" >
+        run/ai_override_EURDKK_M15_BUY_1790176500``). The file is consumed
+        (deleted) on first use and the override journaled as
+        {"type": "ai.override"}. Absent or blank file -> None (no
+        approval). There is deliberately NO standing or config-level
+        override: approval is per-signal, explicit, single-use, and
+        auditable in the journal.
+        """
+        if not signal_id:
+            return None
+        path = os.path.join(self.paths.get("state_dir", ""),
+                            f"ai_override_{signal_id}")
+        try:
+            with open(path, encoding="utf-8",
+                      errors="replace") as f:
+                ref = f.read().strip()
+        except OSError:
+            return None
+        if not ref:
+            return None
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        self.journal({
+            "type": "ai.override",
+            "signal_id": signal_id,
+            "by": ref,
+            "note": ("founder override of the advisory veto "
+                     "(one-shot, consumed)"),
+        })
+        log(f"AI OVERRIDE consumed for {signal_id} by {ref}")
+        return ref
 
     # -- journal / state -------------------------------------------------
     def journal(self, entry):
@@ -1412,9 +1473,27 @@ class TraderEngine:
 
     def _open_info_for(self, ev):
         """Best-known open details for a trade.opened event (EA fields win,
-        executor command index fills the gaps)."""
+        executor command index fills the gaps).
+
+        NOTE (2026-09-23, issue 6): every newly journaled trade.opened
+        carries sl/tp plus sl_tp_source noting provenance: "ea_line" if
+        the EA's trade.opened line carried them, "command" if taken from
+        the matching command.sent (looked up by command_id in cmd_index),
+        "missing" if neither source had them. Historical trade.opened
+        events (all 40 journaled before this change) have NO sl/tp --
+        those values are NOT backfilled; inventing them would corrupt
+        the audit trail.
+        """
         cmd_id = ev.get("command_id")
         known = self.state.get("cmd_index", {}).get(cmd_id or "", {})
+        sl = ev.get("sl") if ev.get("sl") is not None else known.get("sl")
+        tp = ev.get("tp") if ev.get("tp") is not None else known.get("tp")
+        if ev.get("sl") is not None or ev.get("tp") is not None:
+            sl_tp_source = "ea_line"
+        elif sl is not None or tp is not None:
+            sl_tp_source = "command"
+        else:
+            sl_tp_source = "missing"
         return {
             "ticket": ev.get("ticket"),
             "deal": ev.get("deal"),
@@ -1426,6 +1505,9 @@ class TraderEngine:
             "time": ev.get("time"),
             "signal_id": ev.get("signal_id") or known.get("signal_id"),
             "command_id": cmd_id,
+            "sl": sl,
+            "tp": tp,
+            "sl_tp_source": sl_tp_source,
         }
 
     # ------------------------------------------------------------------
@@ -1696,6 +1778,8 @@ class TraderEngine:
                       "symbol": sig.get("symbol"),
                       "direction": sig.get("direction"),
                       "volume": flags["volume"],
+                      "sl": sig.get("stop_loss"),
+                      "tp": sig.get("take_profit"),
                       "entry_price": sig.get("entry_price")}
         return self._emit_command(cmd, cmd_type="trade.open", idem_key=key,
                                   idem_extra=extra, index_info=index_info)
@@ -2007,7 +2091,9 @@ class TraderEngine:
             index_info = {"signal_id": rec.get("signal_id"),
                           "symbol": rec.get("symbol"),
                           "direction": rec.get("direction"),
-                          "volume": rec.get("volume")}
+                          "volume": rec.get("volume"),
+                          "sl": rec.get("sl"),
+                          "tp": rec.get("tp")}
         elif cmd_type == "trade.close":
             cmd = {"type": "trade.close", "id": new_cmd_id,
                    "position_id": rec.get("ticket"),
@@ -2358,20 +2444,6 @@ class TraderEngine:
             open_lots=open_lots, consecutive_losses=consecutive_losses,
             tick_age_s=tick_age_s,
         )
-        # Worker C (2026-09-23): advisory AI call. Additive only -- it
-        # journals ai.decision and can never force a trade. A veto applies
-        # only when config ai_veto_enabled is true (default false).
-        advisory = self._ai_advise(sig, specs, decision, cfg)
-        if (decision == "commanded" and cfg.get("ai_veto_enabled")
-                and advisory is not None
-                and advisory.get("valid")
-                and advisory["decision"].decision == "NO_TRADE"):
-            log(f"AI VETO: {sig.get('id')} ({sig.get('symbol')} "
-                f"{sig.get('direction')}) -- "
-                f"{advisory['decision'].thesis}")
-            decision = "skipped:ai_veto"
-            flags = {"vetoed_by": "ai", "ai_thesis":
-                     advisory["decision"].thesis}
         # Worker C (2026-09-23): per-mode side effects from the M5/M6
         # flags. check_gates is pure; the engine owns the I/O.
         mode_state = self._mode_state
@@ -2434,6 +2506,36 @@ class TraderEngine:
             log(f"HALTED (disconnect): {sig.get('id')} "
                 f"({sig.get('symbol')} {sig.get('direction')}) not entered "
                 f"[no fresh broker data]")
+        # Repair round 2 (2026-09-24): the advisory veto is ALWAYS
+        # enforced, fail-closed, on the final commanded decision. The old
+        # ai_veto_enabled opt-in is gone: with it off (the default), an
+        # honest AI NO_TRADE was silently overridden and commanded anyway
+        # (EURDKK 2026-09-23, -$117.73). It sits AFTER the structural
+        # halts above, so a one-shot founder override is never burned on
+        # a signal a halt would block anyway. _ai_advise records the
+        # advisory (a failed engine call records a fail-closed NO_TRADE);
+        # apply_advisory_veto() consults the registry. The ONLY way
+        # through a veto is a one-shot founder approval file consumed
+        # below and journaled as ai.override.
+        if decision in ("commanded", "intended"):
+            import ai_engine as _ae
+            # The advisory is recorded (additive ai.decision journal line)
+            # for both live and dry-run decisions; the veto itself only
+            # ever bites on "commanded".
+            self._ai_advise(sig, specs, decision, cfg)
+            approval = (self._consume_ai_override(sig.get("id"))
+                        if decision == "commanded" else None)
+            pre_veto = decision
+            decision, veto_reason = _ae.apply_advisory_veto(
+                sig.get("id"), decision, operator_approval=approval)
+            if decision != pre_veto:
+                log(f"AI VETO: {sig.get('id')} ({sig.get('symbol')} "
+                    f"{sig.get('direction')}) -- {veto_reason}")
+                flags = dict(flags or {})
+                flags["vetoed_by"] = "ai"
+                flags["veto_reason"] = veto_reason
+                entry["vetoed_by"] = "ai"
+                entry["veto_reason"] = veto_reason
         if decision == "commanded":
             # Worker B (2026-09-23): real filling modes. A spec-provided
             # filling_mode rides in the command; an explicitly

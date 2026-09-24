@@ -16,7 +16,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 BRIDGE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BRIDGE)
@@ -72,7 +72,10 @@ def save_state(run_dir, state):
 
 def journal(run_dir, entry):
     entry = dict(entry)
-    entry.setdefault("time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    # Repair round 2 (2026-09-24): UTC by construction (see
+    # trade_executor.now_str).
+    entry.setdefault("time", datetime.now(timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S"))
     with open(os.path.join(run_dir, "nova_journal.jsonl"), "a") as f:
         f.write(json.dumps(entry) + "\n")
 

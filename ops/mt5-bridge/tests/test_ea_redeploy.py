@@ -99,7 +99,11 @@ def test_reconciled_close_real_pnl_mirrored(tmp_path):
     assert closes[0]["profit"] == -54.48
     assert closes[0]["reason"] == "broker"
     jp = os.path.join(sd, "nova_journal.jsonl")
-    today = time.strftime("%Y-%m-%d")
+    # The fixture close is dated 2026.09.23: derive "today" from the
+    # fixture, not the wall clock (repair round 2, 2026-09-24 -- the old
+    # time.strftime("%Y-%m-%d") made this test a date bomb that fails on
+    # any day other than 2026-09-23).
+    today = "2026-09-23"
     _, pnl, losses = te.load_trade_state(tp, today, jp)
     assert pnl == -54.48
     assert losses == 1
@@ -129,7 +133,8 @@ def test_reconciled_close_unknown_pnl_is_safe(tmp_path):
     assert closes[0]["profit"] is None
     assert closes[0]["profit_status"] == "unknown"
     jp = os.path.join(sd, "nova_journal.jsonl")
-    today = time.strftime("%Y-%m-%d")
+    # Fixture close is dated 2026.09.23 -- see the date-bomb note above.
+    today = "2026-09-23"
     open_pos, pnl, losses = te.load_trade_state(tp, today, jp)
     assert pnl == 0.0  # unknown contributes nothing, fabricates nothing
     assert losses == 0  # unknown must not count as a loss

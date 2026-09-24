@@ -252,7 +252,7 @@ def compute_metrics(journal_path, trades_path=None):
 def _journal_append(journal_path, entry):
     entry = dict(entry)
     entry.setdefault(
-        "time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        "time", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
     d = os.path.dirname(os.path.abspath(journal_path))
     os.makedirs(d, exist_ok=True)
     with open(journal_path, "a", encoding="utf-8") as f:

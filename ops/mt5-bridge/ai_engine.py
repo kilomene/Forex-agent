@@ -23,10 +23,12 @@ Honest limits (read before wiring anything to real money):
   * NO_TRADE is a first-class, always-allowed outcome. With no indicator
     data the engine deterministically returns NO_TRADE ("insufficient
     data") -- it will not hallucinate a setup.
-  * The engine is ADVISORY. Wiring (see trade_executor._ai_advise) journals
-    every decision as {"type": "ai.decision"}; it may VETO a signal the
-    pipeline would otherwise take (config ai_veto_enabled, default OFF)
-    but it can NEVER force a trade the existing pipeline would not take.
+  * The engine is ADVISORY. Wiring (see trade_executor._ai_advise)
+    journals every decision as {"type": "ai.decision"} and ALWAYS enforces
+    the veto (fail-closed): an honest NO_TRADE, a failed engine call, or a
+    missing/invalid record vetoes a commanded signal. The only way through
+    is a one-shot founder approval file (run/ai_override_<signal_id>).
+    It can NEVER force a trade the existing pipeline would not take.
 
 ML contract for future work (when a real model is trained):
   * Train ONLY on real broker history (ticks/deals from the account's own
@@ -43,6 +45,7 @@ ML contract for future work (when a real model is trained):
 
 import math
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 
 AI_VERSION = "ai-engine-0.1-advisory"
 
@@ -580,3 +583,139 @@ def advise(signal, market_context=None):
         "ai_version": AI_VERSION,
         "ml_status": ml_status()["status"],
     }
+
+
+# ---------------------------------------------------------------- hard advisory veto
+# Track 5 (2026-09-23): an advisory NO_TRADE must never be silently
+# overridden. Regression driver: signal EURDKK_M15_BUY_1790176500 got an
+# ai.decision of NO_TRADE / confidence 0.0, yet the executor commanded it
+# anyway (fill, then closed -$117.73) because the veto was opt-in and off.
+#
+# The executor records each advisory via record_advisory() and consults
+# advisory_allows_trade() / apply_advisory_veto() before writing any
+# command. FAIL-CLOSED: a missing record, a None advisory (engine call
+# failed), an invalid advisory, or NO_TRADE all read as "do not trade".
+# The ONLY way through a veto is an explicit operator approval passed by
+# the caller (default off); the caller journals it as
+# {"type": "ai.override", ...}. An override can never force a trade the
+# gates already refused -- it only permits a "commanded" signal to stand.
+#
+# NOTE: the registry is in-process. Every handle_signal() re-advises and
+# re-records before consulting, so a record always exists for the signal
+# under decision; a missing record means "not advised", i.e. NO_TRADE.
+
+_advisory_records = {}   # signal_id -> record dict
+
+
+def _utcnow_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def record_advisory(signal_id, advisory):
+    """Store the advisory for signal_id.
+
+    ``advisory`` is the dict returned by advise(), or None when the
+    engine call failed/raised. Returns the stored record.
+    """
+    if advisory is None:
+        rec = {
+            "decision": "NO_TRADE",
+            "confidence": 0.0,
+            "valid": False,
+            "validation_errors": ["advisory unavailable "
+                                  "(engine call failed or raised)"],
+            "thesis": "advisory unavailable -- fail closed",
+            "ai_version": AI_VERSION,
+            "ml_status": ml_status()["status"],
+            "recorded_at": _utcnow_iso(),
+        }
+    else:
+        dec = advisory.get("decision")
+        rec = {
+            "decision": getattr(dec, "decision", None),
+            "confidence": getattr(dec, "confidence", 0.0),
+            "valid": bool(advisory.get("valid")),
+            "validation_errors": list(advisory.get("validation_errors")
+                                      or []),
+            "thesis": getattr(dec, "thesis", "") or "",
+            "ai_version": advisory.get("ai_version"),
+            "ml_status": advisory.get("ml_status"),
+            "recorded_at": _utcnow_iso(),
+        }
+    _advisory_records[signal_id] = rec
+    return rec
+
+
+def get_advisory_record(signal_id):
+    """Return the stored advisory record for signal_id, or None."""
+    return _advisory_records.get(signal_id)
+
+
+def clear_advisory_records():
+    """Drop all stored records. Used by tests; never call in production."""
+    _advisory_records.clear()
+
+
+def _approval_ref(operator_approval):
+    """Extract an approval reference, or None if approval is absent.
+
+    Accepted forms: {"ref": ...} / {"by": ...} (non-empty), or a
+    non-empty string. Anything else (None, {}, blank, non-string junk)
+    is NOT an approval.
+    """
+    if isinstance(operator_approval, dict):
+        ref = (operator_approval.get("ref")
+               or operator_approval.get("by"))
+    elif isinstance(operator_approval, str):
+        ref = operator_approval
+    else:
+        return None
+    ref = str(ref).strip() if ref is not None else ""
+    return ref or None
+
+
+def advisory_allows_trade(signal_id, operator_approval=None):
+    """Hard advisory veto, fail-closed. Returns (allowed, reason).
+
+    * operator_approval: explicit operator approval (see _approval_ref).
+      Default None = off. When present and valid the trade is allowed
+      with reason "operator_override:<ref>" -- the caller must journal
+      the approval as {"type": "ai.override", ...}.
+    * missing record / None advisory / invalid advisory / NO_TRADE ->
+      (False, reason).
+    * validated TRADE advisory -> (True, "advisory_ok").
+    """
+    approval_ref = _approval_ref(operator_approval)
+    if approval_ref is not None:
+        return True, f"operator_override:{approval_ref}"
+    rec = _advisory_records.get(signal_id)
+    if rec is None:
+        return False, "advisory_unavailable:no_record_for_signal"
+    if rec.get("decision") != "TRADE" or not rec.get("valid"):
+        if rec.get("decision") == "NO_TRADE":
+            return False, (
+                f"advisory_no_trade:confidence={rec.get('confidence')}:"
+                f"thesis={rec.get('thesis')}")
+        return False, (f"advisory_invalid:decision={rec.get('decision')}:"
+                       f"valid={rec.get('valid')}:"
+                       f"errors={rec.get('validation_errors')}")
+    return True, "advisory_ok"
+
+
+def apply_advisory_veto(signal_id, gate_decision, operator_approval=None):
+    """Decision-side rule: (gate decision, advisory) -> final decision.
+
+    Returns (decision: str, reason: str). "commanded" survives only when
+    the advisory allows it (validated TRADE) or an explicit operator
+    approval is supplied. A refused gate decision is never changed, even
+    with an approval -- the veto can only remove trades, never create
+    them.
+    """
+    if gate_decision != "commanded":
+        return gate_decision, "gate_not_commanded"
+    allowed, reason = advisory_allows_trade(signal_id, operator_approval)
+    if allowed:
+        return "commanded", reason
+    if reason.startswith("advisory_unavailable"):
+        return "skipped:advisory_unavailable", reason
+    return "skipped:advisory_no_trade", reason

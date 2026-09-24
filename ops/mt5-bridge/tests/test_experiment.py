@@ -48,6 +48,11 @@ def sig(**over):
         "symbol": "XPDUSD", "timeframe": "M15", "direction": "BUY",
         "entry_price": 1310.914, "stop_loss": 1306.344,
         "take_profit": 1320.054,
+        # Repair round 2 (2026-09-24): the advisory veto is always on, so
+        # the live "commanded" path needs a TRADE advisory -- trend-aligned
+        # indicator data (RR 2.0).
+        "ema_fast": 1311.5, "ema_slow": 1310.0,
+        "rsi_value": 55, "atr_value": 2.0,
     }
     s.update(over)
     return s

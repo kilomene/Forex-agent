@@ -329,3 +329,198 @@ def integrate(engine):
         te.log("!!! RECONCILE ALERT: critical broker/journal mismatch - "
                "see journal reconcile.finding lines")
     return {"status": "ok", "findings": findings, "alert": alert}
+
+
+# ----------------------------------------------------------------------
+# Durable open/close history rebuild (issue 3, 2026-09-23).
+#
+# Derives authoritative open/close ticket sets PURELY from the two
+# durable logs -- the EA's nova_trades.jsonl and the executor's
+# nova_journal.jsonl -- with no reliance on in-memory state. Used by
+# ticket_tracker.audit_seen_file() and by any audit that must answer
+# "which tickets are really open?" after a restart.
+#
+# Also verifies EVERY journaled close: genuine deal/order IDs present,
+# gross_profit / swap / commission / net_profit present, and
+# net == gross + swap + commission within CLOSE_MATH_TOL. Closes that
+# fail are reported as findings -- missing values are NEVER invented.
+# ----------------------------------------------------------------------
+
+CLOSE_MATH_TOL = 0.05  # |net_profit - (gross+swap+commission)| tolerance
+
+_CLOSE_ID_KEYS = ("deal_id", "deal_in", "deal_out", "order_id",
+                  "position_id", "deal")
+_CLOSE_COMPONENT_KEYS = ("gross_profit", "swap", "commission", "net_profit")
+
+
+def _iter_log_events(path):
+    """Yield (line_no, event_dict) for parseable JSON-object lines.
+
+    Returns (events, bad_lines): bad_lines counts blank/unparseable lines
+    so callers can tell "no events" apart from "unreadable file".
+    """
+    events, bad = [], 0
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return events, bad
+    for i, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            bad += 1
+            continue
+        if isinstance(ev, dict):
+            events.append((i, ev))
+        else:
+            bad += 1
+    return events, bad
+
+
+def _ticket_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def verify_close(ev, tolerance=CLOSE_MATH_TOL):
+    """Verify one journaled trade.closed event.
+
+    Returns a JSON-safe dict:
+      status "pass"       - deal/order IDs present, all four P&L
+                            components present, net == gross+swap+
+                            commission within tolerance.
+      status "incomplete" - anything missing (ids or components), or an
+                            honest unknown/under-reconciliation close
+                            whose P&L is not yet known. missing_fields
+                            lists exactly what is absent.
+      status "mismatch"   - components complete but the arithmetic fails.
+    """
+    ticket = _ticket_int(ev.get("ticket"))
+    out = {"ticket": ticket, "status": "incomplete",
+           "deal_ids": {}, "missing_fields": [], "math": None, "note": ""}
+    if ev.get("profit_status") == "unknown" or (
+            ev.get("exit_price") is None and ev.get("profit") is None):
+        out["note"] = ("honest unknown/under-reconciliation close: "
+                       "P&L not yet known, never invented")
+        out["missing_fields"] = ["exit_price", "profit", "gross_profit",
+                                 "swap", "commission", "net_profit"]
+        return out
+    for key in _CLOSE_ID_KEYS:
+        if ev.get(key) is not None:
+            out["deal_ids"][key] = ev.get(key)
+    if not out["deal_ids"]:
+        out["missing_fields"].append("deal/order ids")
+    comps = {}
+    for key in _CLOSE_COMPONENT_KEYS:
+        v = ev.get(key)
+        if v is None:
+            out["missing_fields"].append(key)
+        else:
+            try:
+                comps[key] = float(v)
+            except (TypeError, ValueError):
+                out["missing_fields"].append(key + " (non-numeric)")
+    if out["missing_fields"]:
+        return out
+    expected = comps["gross_profit"] + comps["swap"] + comps["commission"]
+    diff = comps["net_profit"] - expected
+    out["math"] = {"gross_profit": comps["gross_profit"],
+                   "swap": comps["swap"],
+                   "commission": comps["commission"],
+                   "net_profit": comps["net_profit"],
+                   "expected_net": round(expected, 2),
+                   "diff": round(diff, 2)}
+    if abs(diff) <= tolerance:
+        out["status"] = "pass"
+    else:
+        out["status"] = "mismatch"
+        out["note"] = (f"net_profit != gross+swap+commission "
+                       f"(diff={diff:.2f} > tol={tolerance})")
+    return out
+
+
+def rebuild_open_close_sets(trades_path, journal_path,
+                            tolerance=CLOSE_MATH_TOL):
+    """Rebuild authoritative open/close ticket sets from durable logs.
+
+    Sources: EA nova_trades.jsonl (trades_path) and executor
+    nova_journal.jsonl (journal_path). No memory state is consulted.
+
+    Returns a JSON-safe dict:
+      opened_tickets_ea / opened_tickets_journal - sorted ticket lists
+      closed_tickets_ea / closed_tickets_journal  - sorted ticket lists
+      reconciled_tickets  - broker-confirmed-gone (positions.reconciled)
+      open_tickets        - opened (either source) minus closed (any source)
+      closed_tickets      - union of all close evidence
+      phantoms            - closed w/o any open record (either source)
+      mirror_gaps         - EA-opened tickets with no journal trade.opened
+      journal_extra_opens - journal-opened tickets with no EA trade.opened
+      close_verification  - [verify_close(ev)] for every journal close
+      bad_lines           - {"trades": n, "journal": n}
+    """
+    trades_events, trades_bad = _iter_log_events(trades_path)
+    journal_events, journal_bad = _iter_log_events(journal_path)
+
+    opened_ea, closed_ea = {}, []
+    for _ln, ev in trades_events:
+        t = ev.get("type")
+        ticket = _ticket_int(ev.get("ticket"))
+        if ticket is None:
+            continue
+        if t == "trade.opened":
+            opened_ea[ticket] = ev
+        elif t in ("trade.closed", "trade.close_corrected"):
+            # Repair round 2 (2026-09-24): a trade.close_corrected revision
+            # is close evidence too. A ticket whose only close record is a
+            # correction (provisional close lost across a restart) must not
+            # look open forever.
+            closed_ea.append(ev)
+
+    opened_j, closed_j, reconciled = {}, [], set()
+    for _ln, ev in journal_events:
+        t = ev.get("type")
+        if t == "positions.reconciled":
+            for x in ev.get("tickets_closed") or []:
+                ticket = _ticket_int((x or {}).get("ticket"))
+                if ticket is not None:
+                    reconciled.add(ticket)
+            continue
+        ticket = _ticket_int(ev.get("ticket"))
+        if ticket is None:
+            continue
+        if t == "trade.opened":
+            opened_j[ticket] = ev
+        elif t in ("trade.closed", "trade.close_corrected"):
+            # Repair round 2 (2026-09-24): see the EA-log loop above --
+            # corrections are close evidence in the journal too.
+            closed_j.append(ev)
+
+    closed_ea_t = {_ticket_int(ev.get("ticket")) for ev in closed_ea}
+    closed_j_t = {_ticket_int(ev.get("ticket")) for ev in closed_j}
+    closed_ea_t.discard(None)
+    closed_j_t.discard(None)
+    closed_all = closed_ea_t | closed_j_t | reconciled
+    opened_all = set(opened_ea) | set(opened_j)
+
+    out = {
+        "opened_tickets_ea": sorted(opened_ea),
+        "opened_tickets_journal": sorted(opened_j),
+        "closed_tickets_ea": sorted(closed_ea_t),
+        "closed_tickets_journal": sorted(closed_j_t),
+        "reconciled_tickets": sorted(reconciled),
+        "open_tickets": sorted(opened_all - closed_all),
+        "closed_tickets": sorted(closed_all),
+        "phantoms": sorted(closed_all - opened_all),
+        "mirror_gaps": sorted(set(opened_ea) - set(opened_j)),
+        "journal_extra_opens": sorted(set(opened_j) - set(opened_ea)),
+        "close_verification": [verify_close(ev, tolerance)
+                               for ev in closed_j],
+        "bad_lines": {"trades": trades_bad, "journal": journal_bad},
+    }
+    return out

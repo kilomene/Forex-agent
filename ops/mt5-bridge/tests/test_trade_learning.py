@@ -275,3 +275,104 @@ def test_outage_gap_detection(db, tmp_path):
     row = db.execute("SELECT * FROM outages").fetchone()
     assert row["kind"] == "detected_gap"
     assert "not confirmed" in row["note"]
+
+
+# ---------------------------------------------------------------------------
+# Lesson P&L integrity (TRACK2 regression, 2026-09-23).
+#
+# Root cause guarded: several trade lessons transcribed the close P&L with the
+# leading hundreds digit dropped (journal net -526.26 written as -26.26),
+# understating losses ~8x-32x. The extractor below covers every P&L phrasing
+# observed in the live lessons; the live-DB tests fail if any lesson's stated
+# P&L diverges from the journal-verified broker close figure, or if a journal
+# close has no lesson row at all.
+# ---------------------------------------------------------------------------
+
+import check_lesson_pnl as clp  # noqa: E402
+
+_LIVE_DB = os.environ.get(
+    "LESSON_DB", "/home/hatch/workspace/mt5/data/trade_learning.db")
+_LIVE_JOURNAL = os.environ.get(
+    "LESSON_JOURNAL",
+    "/home/hatch/workspace/mt5/bridge/run/nova_journal.jsonl")
+
+_live_available = os.path.exists(_LIVE_DB) and os.path.exists(_LIVE_JOURNAL)
+needs_live = pytest.mark.skipif(
+    not _live_available, reason="live lessons DB / journal not present")
+
+
+class TestExtractClaimedPnl:
+    """Hermetic unit tests for the P&L-claim extractor (no live data)."""
+
+    def test_realized_formats(self):
+        assert clp.extract_claimed_pnl("Realized -26.26.") == [-26.26]
+        assert clp.extract_claimed_pnl("Realized loss (-99.38) was large") == [-99.38]
+        assert clp.extract_claimed_pnl("Realized net -2016.15, broker-confirmed") == [-2016.15]
+
+    def test_banked_format(self):
+        assert clp.extract_claimed_pnl("-> +10,845.73 banked") == [10845.73]
+        assert clp.extract_claimed_pnl("+227.75 banked.") == [227.75]
+
+    def test_verb_anchored_formats(self):
+        assert clp.extract_claimed_pnl("broker close, -$197.49.") == [-197.49]
+        assert clp.extract_claimed_pnl("Stopped out at SL for -$107.34.") == [-107.34]
+        assert clp.extract_claimed_pnl("Scratched at 3792.25 (+0.08) after 11h") == [0.08]
+        assert clp.extract_claimed_pnl("full -1R honored: -9.91") == [-9.91]
+        assert clp.extract_claimed_pnl("Loss -$137.98 vs $100 planned risk") == [-137.98]
+
+    def test_arrow_zero_format(self):
+        assert clp.extract_claimed_pnl("exit = entry 3803.62 -> 0.0 (backfilled)") == [0.0]
+
+    def test_non_pnl_numbers_ignored(self):
+        # prices, RSI, lots, ATR and planned-risk mentions are not P&L claims
+        text = ("EMA20 crossed above EMA50, RSI 65.1. Entry 1.87745, "
+                "35 lots on 5.7-pip SL, ATR 0.00038, planned risk $100.")
+        assert clp.extract_claimed_pnl(text) == []
+
+    def test_swap_components_ignored(self):
+        text = "Realized -105.76 (net; gross -115.40 + 9.64 swap credit)."
+        assert clp.extract_claimed_pnl(text) == [-105.76]
+
+    def test_prior_trade_reference_ignored(self):
+        text = ("Stopped at SL, broker close, -$222.86. Also: second stopped "
+                "long today (prior EURGBP SELL -102.22 under $100 regime).")
+        assert clp.extract_claimed_pnl(text) == [-222.86]
+
+    def test_verified_close_pnl_prefers_net_and_corrections(self, tmp_path):
+        jp = tmp_path / "j.jsonl"
+        jp.write_text("\n".join(json.dumps(e) for e in [
+            {"type": "trade.closed", "ticket": 1, "profit": -100.0,
+             "net_profit": -105.5, "time": "2026-09-22 10:00:00"},
+            {"type": "trade.closed", "ticket": 2, "profit": None,
+             "time": "2026-09-22 10:00:00"},   # provisional, no figure yet
+            {"type": "trade.closed", "ticket": 2, "profit": -50.0,
+             "time": "2026-09-22 11:00:00"},   # later real figure wins
+            {"type": "trade.close_corrected", "ticket": 1, "profit": -90.0,
+             "net_profit": -95.0, "time": "2026-09-22 12:00:00"},
+        ]) + "\n")
+        got = clp.verified_close_pnl(str(jp))
+        assert got == {"1": -95.0, "2": -50.0}
+
+
+@needs_live
+class TestLiveLessonPnlIntegrity:
+    """Run against the live lessons DB + journal; skip when absent."""
+
+    def test_live_every_journal_close_has_a_lesson(self):
+        res = clp.check_lessons(_LIVE_DB, _LIVE_JOURNAL)
+        assert res["missing_lessons"] == [], (
+            f"journal closes with no lesson row: {res['missing_lessons']}")
+
+    def test_live_lesson_pnl_matches_verified_close_pnl(self):
+        res = clp.check_lessons(_LIVE_DB, _LIVE_JOURNAL)
+        detail = []
+        for ref, claims, want in res["mismatches"]:
+            detail.append(
+                f"ticket {ref}: lesson claims {claims}, journal-verified {want:+.2f}")
+        for ref in res["missing_claims"]:
+            detail.append(
+                f"ticket {ref}: lesson states no P&L, "
+                f"journal-verified {res['verified'][ref]:+.2f}")
+        assert not detail, (
+            "lesson P&L diverges from journal-verified close P&L:\n"
+            + "\n".join(detail))

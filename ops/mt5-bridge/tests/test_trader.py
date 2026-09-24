@@ -84,6 +84,11 @@ FIXTURE_SIGNALS = [
         "entry_price": 1310.914, "stop_loss": 1306.344,
         "take_profit": 1320.054, "candle_time": "2026.09.21 22:00:00",
         "strategy": "ema_rsi",
+        # Repair round 2 (2026-09-24): the advisory veto is always on, so
+        # live "commanded" paths need a TRADE advisory -- these carry
+        # trend-aligned indicator data (RR 2.0 on all three).
+        "ema_fast": 1311.5, "ema_slow": 1310.0,
+        "rsi_value": 55, "atr_value": 2.0,
     },
     {
         "id": "BAC_M15_BUY_1790027100", "type": "signal.detected",
@@ -91,6 +96,8 @@ FIXTURE_SIGNALS = [
         "entry_price": 58.23, "stop_loss": 58.04,
         "take_profit": 58.61, "candle_time": "2026.09.21 21:45:00",
         "strategy": "ema_rsi",
+        "ema_fast": 58.3, "ema_slow": 58.1,
+        "rsi_value": 58, "atr_value": 0.1,
     },
     {
         "id": "XPTUSD_M15_BUY_1790028900", "type": "signal.detected",
@@ -98,6 +105,8 @@ FIXTURE_SIGNALS = [
         "entry_price": 1807.751, "stop_loss": 1802.491,
         "take_profit": 1818.27, "candle_time": "2026.09.21 22:15:00",
         "strategy": "ema_rsi",
+        "ema_fast": 1808.5, "ema_slow": 1807.0,
+        "rsi_value": 52, "atr_value": 3.0,
     },
 ]
 
