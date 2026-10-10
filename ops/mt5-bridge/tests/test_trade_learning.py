@@ -173,6 +173,46 @@ def test_unknown_outcome_never_invents_pnl(db, sources):
     assert t444["status"] == "open"
 
 
+def test_close_corrected_supersedes_provisional_close(db, tmp_path):
+    """Regression (2026-10-10, T6 scribe): a broker-confirmed trade.close_corrected
+    sitting in the journal must be applied to the trades row -- before the fix,
+    ingest ignored the event and the row kept the provisional estimate."""
+    state = tmp_path / "st"
+    state.mkdir()
+    (state / "nova_journal.jsonl").write_text("\n".join([
+        json.dumps({
+            "type": "trade.closed", "ticket": 555, "symbol": "GBPAUD",
+            "direction": "BUY", "volume": 35.0, "profit": -1495.22,
+            "commission": None, "swap": None, "reason": "broker-sl-reconciled",
+            "note": "Reconciled from terminal log; profit estimated from specs "
+                    "tick_value, excl. commission/swap",
+            "time": "2026-09-22 04:06:03"}),
+        json.dumps({
+            "type": "trade.close_corrected", "ticket": 555, "symbol": "GBPAUD",
+            "profit": -1495.41, "commission": 0.0, "swap": -520.74,
+            "net_profit": -2016.15, "prior_profit_estimate": -1495.22,
+            "confirmation_status": "broker-confirmed", "reconciled": True,
+            "deal_out": 10334148462, "reason": "broker-sl",
+            "note": "Supersedes the provisional -1495.22 close: broker shows "
+                    "swap -520.74, net -2016.15.",
+            "source": "QueryClose MQL5/Files/history_query.json "
+                      "(authoritative MT5 deal history)",
+            "time": "2026-09-22 04:06:03"}),
+    ]) + "\n")
+    tl.ingest_journal(db, path=str(state / "nova_journal.jsonl"))
+    row = db.execute("SELECT * FROM trades WHERE ticket=555").fetchone()
+    assert row["status"] == "closed"
+    assert row["profit"] == -1495.41
+    assert row["commission"] == 0.0
+    assert row["swap"] == -520.74
+    assert row["broker_confirmed"] == 1, "correction is broker-confirmed"
+    assert row["provisional"] == 0
+    # idempotent: re-ingesting the correction does not duplicate or corrupt
+    tl.ingest_journal(db, path=str(state / "nova_journal.jsonl"))
+    row2 = db.execute("SELECT * FROM trades WHERE ticket=555").fetchone()
+    assert row2["profit"] == -1495.41 and row2["broker_confirmed"] == 1
+
+
 def test_known_vanished_ticket_gets_honesty_note(db, tmp_path):
     state = tmp_path / "st"
     files = tmp_path / "f"

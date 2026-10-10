@@ -549,6 +549,13 @@ def ingest_journal(conn, path=JOURNAL_PATH):
                 )
         elif t == "trade.closed":
             _apply_trade_close(conn, e, from_broker=False, local_time=local_time)
+        elif t == "trade.close_corrected":
+            # Corrections supersede the original close: they are written from
+            # authoritative MT5 deal history (QueryClose), so treat them as
+            # broker-authoritative. (Gap found 2026-10-10 by T6 scribe: a
+            # broker-confirmed trade.close_corrected sat in the journal but was
+            # never applied, leaving the trades row on the provisional figure.)
+            _apply_trade_close(conn, e, from_broker=True, local_time=local_time)
         elif t == "trade.reconciled":
             ticket = e.get("ticket")
             note = e.get("note") or ""
