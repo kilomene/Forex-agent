@@ -146,6 +146,18 @@ DEFAULT_CONFIG = {
                                    # founder approval file.
     "emergency_drawdown_pct": 3.0, # Worker C 2026-09-23: per-mode emergency
                                    # drawdown that trips the kill switch.
+    # Owner order 2026-10-13 ("close any profit that is plunging, with
+    # immediate effect"): profit-plunge guard. Tracks peak unrealized
+    # profit per bot position from the broker positions feed; when a
+    # position that peaked at or above profit_plunge_arm_usd gives back
+    # so much that its current profit falls to profit_plunge_keep_pct
+    # (or less) of that peak, the executor immediately sends a
+    # trade.close command (reason "profit_plunge"). This is a PROTECTIVE
+    # close: it runs every loop even when new entries are halted and is
+    # never gated by the kill switch or trading_enabled.
+    "profit_plunge_guard": True,
+    "profit_plunge_arm_usd": 100.0,
+    "profit_plunge_keep_pct": 0.5,
 }
 
 SPECS_MAX_AGE_S = 300
@@ -207,6 +219,10 @@ EMERGENCY_DRAWDOWN_PCT = 3.0
 #    it so manual positions are visible to exposure/concurrency/
 #    correlation limits instead of only the bot's own journal.
 POSITIONS_FEED_MAX_AGE_S = 60
+# NovaTrader EA magic number: the profit-plunge guard (owner order
+# 2026-10-13) only ever closes positions carrying OUR magic. Manual or
+# foreign-EA positions are never touched by it.
+BOT_MAGIC = 20260921
 # 2. Tick freshness (repo gateway: tick fresh <= 300 s before submit):
 #    refuse a new entry when the signal symbol's last tick is stale.
 TICK_MAX_AGE_S = 120
@@ -2879,6 +2895,138 @@ class TraderEngine:
             + ", ".join(f"{x['ticket']}/{x['symbol']}" for x in tickets))
         return len(tickets)
 
+    # -- profit-plunge guard (owner order 2026-10-13) --------------------
+    def _load_plunge_peaks(self):
+        """Peak unrealized-profit tracker: {ticket: {"peak": float,
+        "closing": bool}}. Persisted in the state dir so peaks survive
+        daemon restarts."""
+        path = os.path.join(self.paths["state_dir"],
+                            "profit_plunge_peaks.json")
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_plunge_peaks(self, peaks):
+        path = os.path.join(self.paths["state_dir"],
+                            "profit_plunge_peaks.json")
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(peaks, f)
+            os.replace(tmp, path)
+        except OSError as e:
+            log(f"warning: profit-plunge peaks save failed: {e}")
+
+    def sweep_profit_plunge(self):
+        """Owner order 2026-10-13: IMMEDIATELY close any bot position
+        whose unrealized profit is plunging -- it peaked at or above
+        profit_plunge_arm_usd and has since fallen to profit_plunge_keep_pct
+        (or less) of that peak. "Plunging toward depreciating" = the win is
+        evaporating; lock in what remains before it breaks down.
+
+        Protective close: runs every loop even when new entries are halted
+        (kill switch, disconnect, trading disabled) and is never gated by
+        them. Only positions carrying BOT_MAGIC are ever touched; manual or
+        foreign-EA positions are invisible to it. Skips the sweep when the
+        broker positions feed is stale -- never close on bad data.
+        Returns the list of tickets a close command was sent for.
+        """
+        cfg = load_config(self.paths["config"])
+        if not cfg.get("profit_plunge_guard", True):
+            return []
+        try:
+            arm = float(cfg.get("profit_plunge_arm_usd", 100.0))
+            keep = float(cfg.get("profit_plunge_keep_pct", 0.5))
+        except (TypeError, ValueError):
+            log("profit-plunge guard: bad arm/keep config; skipping sweep")
+            return []
+        if arm <= 0 or not (0.0 < keep < 1.0):
+            return []
+        positions, fresh = load_broker_positions(self.paths["files_dir"])
+        if not fresh:
+            return []
+        live_tickets = set()
+        peaks = self._load_plunge_peaks()
+        closed_now = []
+        dirty = False
+        for p in positions:
+            try:
+                if int(p.get("magic") or 0) != BOT_MAGIC:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            ticket = str(p.get("ticket"))
+            live_tickets.add(ticket)
+            try:
+                profit = float(p.get("profit") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            rec = peaks.get(ticket) or {}
+            try:
+                peak = float(rec.get("peak", profit))
+            except (TypeError, ValueError):
+                peak = profit
+            if profit > peak:
+                peak = profit
+            if rec.get("closing"):
+                # Close already commanded; wait for the broker to confirm
+                # (the ticket vanishes from the feed). Never double-command
+                # from here -- the idempotency funnel would suppress it
+                # anyway.
+                if peak != rec.get("peak"):
+                    peaks[ticket] = {"peak": peak, "closing": True}
+                    dirty = True
+                continue
+            if peak >= arm and profit <= peak * keep:
+                symbol = p.get("symbol")
+                self.journal({
+                    "type": "trade.profit_plunge",
+                    "ticket": p.get("ticket"),
+                    "symbol": symbol,
+                    "direction": p.get("type"),
+                    "peak_profit": round(peak, 2),
+                    "current_profit": round(profit, 2),
+                    "arm_usd": arm,
+                    "keep_pct": keep,
+                    "reason": ("profit plunging from peak; closing "
+                               "immediately per owner order 2026-10-13"),
+                })
+                if cfg.get("dry_run"):
+                    self.journal({
+                        "type": "trade.profit_plunge_intended",
+                        "ticket": p.get("ticket"),
+                        "symbol": symbol,
+                        "note": "dry_run: close intended, nothing sent",
+                    })
+                    log(f"PROFIT-PLUNGE (dry_run): ticket {ticket} {symbol} "
+                        f"peak ${peak:.2f} -> ${profit:.2f}; close intended, "
+                        f"not sent")
+                    closing = False
+                else:
+                    status, _cmd = self.send_close_command(
+                        p.get("ticket"), symbol=symbol, reason="profit_plunge")
+                    log(f"PROFIT-PLUNGE CLOSE {status}: ticket {ticket} "
+                        f"{symbol} peak ${peak:.2f} -> ${profit:.2f}")
+                    closing = status in ("sent", "duplicate")
+                    if status == "sent":
+                        closed_now.append(ticket)
+                peaks[ticket] = {"peak": peak, "closing": closing}
+                dirty = True
+            elif peak != rec.get("peak"):
+                peaks[ticket] = {"peak": peak, "closing": False}
+                dirty = True
+        # Prune: a ticket gone from a FRESH broker feed is closed -- drop
+        # its peak so a future reuse of the number can't inherit it.
+        for ticket in [t for t in peaks if t not in live_tickets]:
+            del peaks[ticket]
+            dirty = True
+        if dirty:
+            self._save_plunge_peaks(peaks)
+        return closed_now
+
     def run_once(self):
         self.tail_trades()
         # Worker B (2026-09-23): disconnect check first -- a stale broker
@@ -2888,6 +3036,12 @@ class TraderEngine:
         # detection + broker-state reconcile before any single resend.
         self.sweep_timeouts()
         self.reconcile_phantom_positions()
+        # Owner order 2026-10-13: profit-plunge guard -- protective close
+        # of plunging winners. Runs even when new entries are halted.
+        try:
+            self.sweep_profit_plunge()
+        except Exception as e:
+            log(f"profit-plunge sweep error: {e}")
         # Coordinator (2026-09-23): continuous local-vs-broker reconciliation
         # (§28). Read-only: journals reconcile.finding events, never marks a
         # position closed (only broker trade.closed does that). Skips when the
