@@ -167,7 +167,19 @@ bool GetJsonNumber(const string line, const string key, double &val)
 //+------------------------------------------------------------------+
 int LoadSymbolList(string &out[])
 {
-   int h = FileOpen("nova_symbols.txt", FILE_READ|FILE_TXT|FILE_ANSI);
+   // Both EAs' OnInit can run within milliseconds of each other after a
+   // terminal restart; under Wine those near-simultaneous FileOpen() calls
+   // race and one of them intermittently returns INVALID_HANDLE. Retry
+   // briefly instead of falling back to InSymbols — the chart profile
+   // truncates long string inputs at 255 chars, so the fallback silently
+   // shrinks the watchlist (35 symbols) with no recovery path.
+   // (Ported from NovaSignals v1.02, engagement #3.)
+   int h = INVALID_HANDLE;
+   for(int attempt = 0; attempt < 10 && h == INVALID_HANDLE; attempt++)
+   {
+      if(attempt > 0) Sleep(200);
+      h = FileOpen("nova_symbols.txt", FILE_READ|FILE_TXT|FILE_ANSI);
+   }
    string src = "";
    if(h != INVALID_HANDLE)
    {
@@ -916,9 +928,59 @@ void EnsureSymbols()
       Print("NovaTrader: recovered ", added, " symbols post-restart, total=", g_nsym);
 }
 
+//+------------------------------------------------------------------+
+//| Racheal engagement #4 (2026-10-09): EA-side tick_value validation|
+//|                                                                  |
+//| The broker misreports SYMBOL_TRADE_TICK_VALUE (10x too low on     |
+//| metals, ~1000x too high on XAUCHF/XAUGBP, the EURUSD rate itself  |
+//| on XAUEUR/XAGEUR). Validate every symbol before publishing:      |
+//|                                                                  |
+//|  - tick_value, tick_size, contract_size must all be positive.     |
+//|  - When the profit currency equals the account currency, the     |
+//|    expected tick_value is EXACTLY tick_size * contract_size; a   |
+//|    reported value more than 10% off is INVALID.                  |
+//|  - Cross-currency symbols cannot be validated EA-side (needs FX  |
+//|    conversion); they are published as unvalidated with            |
+//|    contract_size so the executor can apply its own checks.        |
+//|                                                                  |
+//| Returns true when the reported tick_value is safe to size on.     |
+//| `expected` carries the computed expectation (0 when not          |
+//| applicable). Never throws; garbage input -> invalid, never ok.   |
+//+------------------------------------------------------------------+
+bool ValidateTickValue(string sym, double tick_value, double tick_size,
+                       double contract_size, string profit_ccy,
+                       string acct_ccy, string &note, double &expected)
+{
+   expected = 0.0;
+   if(tick_value <= 0)       { note = "tick_value_non_positive";   return false; }
+   if(tick_size <= 0)        { note = "tick_size_non_positive";    return false; }
+   if(contract_size <= 0)    { note = "contract_size_non_positive"; return false; }
+   if(profit_ccy != "" && profit_ccy == acct_ccy)
+   {
+      expected = tick_size * contract_size;
+      if(expected <= 0 || !MathIsValidNumber(expected))
+      { note = "expected_not_finite"; return false; }
+      if(!MathIsValidNumber(tick_value))
+      { note = "tick_value_not_finite"; return false; }
+      double ratio = tick_value / expected;
+      if(ratio < 0.9 || ratio > 1.1)
+      {
+         note = StringFormat("mismatch:reported=%.4f,expected=%.4f,ratio=%.2f",
+                             tick_value, expected, ratio);
+         return false;
+      }
+      note = "validated";
+      return true;
+   }
+   note = "unvalidated_cross_currency";
+   return true;
+}
+
 void WriteSpecs()
 {
    string syms = "";
+   string acct_ccy = AccountInfoString(ACCOUNT_CURRENCY);
+   int tv_invalid = 0;
    for(int i = 0; i < g_nsym; i++)
    {
       string s = g_symbols[i];
@@ -929,14 +991,38 @@ void WriteSpecs()
       long   spread = 0;
       if(point > 0 && bid > 0 && ask > 0)
          spread = (long)MathRound((ask - bid) / point);
+      // Racheal engagement #4 (2026-10-09): EA-side tick_value validation
+      // + contract_size publishing. The broker misreports tick_value by
+      // 10x on metals; validate before publishing and mark failures
+      // loudly so the executor never sizes on garbage.
+      double tv    = SymbolInfoDouble(s, SYMBOL_TRADE_TICK_VALUE);
+      double tsize = SymbolInfoDouble(s, SYMBOL_TRADE_TICK_SIZE);
+      double csize = SymbolInfoDouble(s, SYMBOL_TRADE_CONTRACT_SIZE);
+      string pccy  = SymbolInfoString(s, SYMBOL_CURRENCY_PROFIT);
+      string tv_note; double tv_expected;
+      bool tv_ok = ValidateTickValue(s, tv, tsize, csize, pccy, acct_ccy,
+                                    tv_note, tv_expected);
+      if(!tv_ok)
+      {
+         tv_invalid++;
+         Print("NovaTrader: TICK_VALUE INVALID for ", s, " (", tv_note,
+               ") — executor must not size on reported tick_value");
+      }
       if(i > 0) syms += ",";
       syms += StringFormat(
-         "\"%s\":{\"tick_value\":%s,\"tick_size\":%s,\"volume_min\":%s,"
-         "\"volume_max\":%s,\"volume_step\":%s,\"stops_level_points\":%d,"
-         "\"spread_points\":%d,\"digits\":%d,\"point\":%s}",
+         "\"%s\":{\"tick_value\":%s,\"tick_size\":%s,\"contract_size\":%s,"
+         "\"tick_value_ok\":%s,\"tick_value_note\":\"%s\","
+         "\"expected_tick_value\":%s,\"profit_currency\":\"%s\","
+         "\"volume_min\":%s,\"volume_max\":%s,\"volume_step\":%s,"
+         "\"stops_level_points\":%d,\"spread_points\":%d,\"digits\":%d,\"point\":%s}",
          s,
-         DoubleToString(SymbolInfoDouble(s, SYMBOL_TRADE_TICK_VALUE), 8),
-         DoubleToString(SymbolInfoDouble(s, SYMBOL_TRADE_TICK_SIZE), 8),
+         DoubleToString(tv, 8),
+         DoubleToString(tsize, 8),
+         DoubleToString(csize, 2),
+         tv_ok ? "true" : "false",
+         JsonEscape(tv_note),
+         DoubleToString(tv_expected, 8),
+         JsonEscape(pccy),
          DoubleToString(SymbolInfoDouble(s, SYMBOL_VOLUME_MIN), 8),
          DoubleToString(SymbolInfoDouble(s, SYMBOL_VOLUME_MAX), 8),
          DoubleToString(SymbolInfoDouble(s, SYMBOL_VOLUME_STEP), 8),
@@ -944,6 +1030,9 @@ void WriteSpecs()
          spread, digits,
          DoubleToString(point, 8));
    }
+   if(tv_invalid > 0)
+      Print("NovaTrader: specs published with ", tv_invalid,
+            " INVALID tick_value(s) — see TICK_VALUE INVALID lines above");
 
    string serverName = AccountInfoString(ACCOUNT_SERVER);
    // Account identity for the executor's identity lock (§7): the login is
