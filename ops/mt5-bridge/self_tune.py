@@ -66,11 +66,24 @@ IMMUTABLE = {"trading_enabled", "dry_run", "max_daily_loss_pct",
 
 
 def _parse_mt5_time(s):
-    try:
-        return datetime.strptime(str(s)[:19], "%Y.%m.%d %H:%M:%S").replace(
-            tzinfo=timezone.utc)
-    except (ValueError, TypeError):
-        return None
+    """Parse broker dotted time or executor dashed UTC time.
+
+    The journal mixes both: trade.closed carries the EA's dotted broker
+    time ("2026.10.13 21:06:36"); executor-written events (e.g.
+    account.identity_mismatch) carry now_str()'s dashed UTC
+    ("2026-10-13 17:25:27"). Both are UTC by construction. Racheal
+    engagement 006: previously only the dotted form parsed, which
+    silently disabled the identity-mismatch kill trip on real data
+    (the feature's own tests used dotted times, so the suite stayed
+    green while the trip could never fire).
+    """
+    for fmt in ("%Y.%m.%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(str(s)[:19], fmt).replace(
+                tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            continue
+    return None
 
 
 def load_closed_trades(journal_path, lookback_days=LOOKBACK_DAYS, now=None):
@@ -112,7 +125,15 @@ def load_closed_trades(journal_path, lookback_days=LOOKBACK_DAYS, now=None):
                     continue
             if pnl is None:
                 continue
-            out.append({"ticket": ev.get("ticket"), "symbol": ev.get("symbol"),
+            # Racheal engagement 006: coerce non-string symbols. A crafted
+            # journal line with a dict/list symbol used to crash propose()
+            # (sorted() TypeError on mixed key types), killing every future
+            # run since the bad line is never consumed. "UNKNOWN" can never
+            # match a real broker symbol, so blocking it later is harmless.
+            sym = ev.get("symbol")
+            if not isinstance(sym, str) or not sym:
+                sym = "UNKNOWN"
+            out.append({"ticket": ev.get("ticket"), "symbol": sym,
                         "direction": ev.get("direction"), "pnl": pnl,
                         "time": ts})
     return out
@@ -206,11 +227,19 @@ def validate(proposals, cfg):
         elif key not in ALLOWLIST:
             why = f"{key} is not an allowlisted tunable"
         elif key == "blocked_symbols":
-            old = set(cfg.get("blocked_symbols") or [])
-            if not (set(new) >= old):
-                why = "blocked_symbols is add-only (re-inclusion needs Zenas)"
-            elif not all(isinstance(s, str) and s for s in new):
-                why = "blocked_symbols must be a list of symbol strings"
+            # Racheal engagement 006: `new` must be a list. A bare string
+            # used to pass (its chars are strings) and would have turned
+            # the executor's `symbol in blocked` membership test into a
+            # substring test.
+            if not isinstance(new, list):
+                why = "blocked_symbols new value must be a list"
+            else:
+                old = set(cfg.get("blocked_symbols") or [])
+                if not (set(new) >= old):
+                    why = ("blocked_symbols is add-only "
+                           "(re-inclusion needs Zenas)")
+                elif not all(isinstance(s, str) and s for s in new):
+                    why = "blocked_symbols must be a list of symbol strings"
         else:
             lo, hi = ALLOWLIST[key]
             try:
@@ -305,6 +334,10 @@ def run(state_dir, files_dir, journal_path=None, live=False, now=None):
             cfg = json.load(f)
     except (OSError, ValueError):
         cfg = {}
+    # Racheal engagement 006: a valid-JSON non-dict (e.g. a list) must not
+    # crash propose()/validate() on cfg.get -- treat as unreadable.
+    if not isinstance(cfg, dict):
+        cfg = {}
     closed = load_closed_trades(journal_path, now=now)
     proposals = propose(closed, cfg)
     accepted, rejected = validate(proposals, cfg)
@@ -349,6 +382,16 @@ def run(state_dir, files_dir, journal_path=None, live=False, now=None):
         return report
 
     # live: snapshot, apply accepted, journal
+    # Racheal engagement 006: fail closed when the config could not be
+    # read. The old code fabricated a minimal config here; the executor
+    # already fails safe to defaults on its own, so writing would only
+    # destroy the corrupt file (forensics) and confuse the audit trail.
+    if not cfg:
+        journal({"type": "self_tune.aborted",
+                 "reason": ("risk_config.json missing or unreadable; "
+                            "refusing to fabricate a config")})
+        journal(report)
+        return report
     snap_path = os.path.join(state_dir, "self_tune_snapshot.json")
     prev_snap = None
     try:
@@ -364,11 +407,16 @@ def run(state_dir, files_dir, journal_path=None, live=False, now=None):
         new_cfg[p["key"]] = p["new"]
         report["applied"].append(p["key"])
         journal({"type": "self_tune.applied", **p})
-    _atomic_write_json(cfg_path, new_cfg)
-    journal({"type": "config.changed",
-             "actor": "self_tune",
-             "note": "self-tune loop applied bounded tuning",
-             "applied": report["applied"]})
+    # Racheal engagement 006: only touch the config file (and the audit
+    # trail) when something was actually applied. The old code rewrote
+    # the file and journaled config.changed on every live run, even
+    # no-op ones.
+    if report["applied"]:
+        _atomic_write_json(cfg_path, new_cfg)
+        journal({"type": "config.changed",
+                 "actor": "self_tune",
+                 "note": "self-tune loop applied bounded tuning",
+                 "applied": report["applied"]})
 
     # rollback check against the PREVIOUS snapshot's baseline: if the
     # window since the last applied change clearly degraded expectancy,
@@ -402,8 +450,13 @@ def run(state_dir, files_dir, journal_path=None, live=False, now=None):
                 journal({"type": "kill_switch.tripped",
                          "actor": "self_tune",
                          "reason": fl["detail"]})
-            except OSError:
-                pass
+            except OSError as e:
+                # Racheal engagement 006: a failed kill write must be
+                # LOUD. The old code swallowed it, leaving the journal
+                # claiming a trip that never happened.
+                journal({"type": "self_tune.security_error",
+                         "detail": f"kill-switch write failed: {e}",
+                         "finding": fl["kind"]})
     journal(report)
     return report
 
