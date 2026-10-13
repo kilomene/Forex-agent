@@ -16,7 +16,7 @@
 //| This EA never trades. It only observes and writes files.         |
 //+------------------------------------------------------------------+
 #property copyright "Nova Works"
-#property version   "1.01"
+#property version   "1.02"
 #property strict
 
 input string   InSymbols      = "EURUSD,GBPUSD,USDJPY,USDCHF,AUDUSD,USDCAD,NZDUSD,EURGBP,EURJPY,EURCHF,EURAUD,EURCAD,EURNZD,GBPJPY,GBPCHF,GBPAUD,GBPCAD,GBPNZD,AUDJPY,AUDCAD,AUDNZD,CADJPY,CHFJPY,NZDJPY,USDZAR,USDMXN,USDTRY,USDSEK,USDNOK,USDPLN,USDHKD,USDHUF,USDILS,USDTHB,EURPLN,EURSEK,EURDKK,GBPZAR,AUDSGD,NZDSGD,XAUUSD,XAUEUR,XAUAUD,XAUCHF,XAUGBP,XAGUSD,XAGEUR,XAGAUD,XAGGBP,XPTUSD,XPDUSD,NAS100,US100,US30,US500,RUS2000,VIX,GER40,EU50,FRA40,UK100,JPN225,HK50,AUS200,CHN50,AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA,NFLX,AMD,INTC,KO,PEP,WMT,NKE,DIS,MCD,JPM,BAC,SPCX,USOIL,WTI,UKOIL,BRENT,XNGUSD";
@@ -36,17 +36,34 @@ input double   InAtrTPMult     = 3.0;
 // is absent. Symbols the broker does not carry are skipped gracefully.
 #define MAX_SYM 128
 
+// g_master keeps the FULL requested watchlist so EnsureSymbols() can retry
+// symbols whose SymbolSelect failed at OnInit (post-restart Market Watch
+// sync race). g_nsym tracks only the live/healed subset.
 string   g_symbols[MAX_SYM];
+string   g_master[MAX_SYM];
 int      g_nsym = 0;
+int      g_nmaster = 0;
 int      g_hFast[MAX_SYM], g_hSlow[MAX_SYM], g_hRsi[MAX_SYM], g_hAtr[MAX_SYM];
 datetime g_lastBar[MAX_SYM];
 datetime g_lastSigBar[MAX_SYM];
 datetime g_lastBeat = 0;
+datetime g_lastRetry = 0;   // throttle for EnsureSymbols() retries
 
 //+------------------------------------------------------------------+
 int LoadSymbolList(string &out[])
 {
-   int h = FileOpen("nova_symbols.txt", FILE_READ|FILE_TXT|FILE_ANSI);
+   // Both EAs' OnInit can run within milliseconds of each other after a
+   // terminal restart; under Wine those near-simultaneous FileOpen() calls
+   // race and one of them intermittently returns INVALID_HANDLE. Retry
+   // briefly instead of falling back to InSymbols — the chart profile
+   // truncates long string inputs at 255 chars, so the fallback silently
+   // shrinks the watchlist (35 symbols) with no recovery path.
+   int h = INVALID_HANDLE;
+   for(int attempt = 0; attempt < 10 && h == INVALID_HANDLE; attempt++)
+   {
+      if(attempt > 0) Sleep(200);
+      h = FileOpen("nova_symbols.txt", FILE_READ|FILE_TXT|FILE_ANSI);
+   }
    string src = "";
    if(h != INVALID_HANDLE)
    {
@@ -69,20 +86,62 @@ int LoadSymbolList(string &out[])
 }
 
 //+------------------------------------------------------------------+
+// Retry SymbolSelect + indicator handle creation for master-list symbols
+// missed at OnInit (post-restart Market Watch sync race). Runs throttled
+// from OnTick; heals g_symbols live so non-FX signal evaluation returns.
+void EnsureSymbols()
+{
+   int added = 0;
+   for(int k = 0; k < g_nmaster && g_nsym < MAX_SYM; k++)
+   {
+      string sym = g_master[k];
+      bool have = false;
+      for(int j = 0; j < g_nsym; j++)
+         if(g_symbols[j] == sym) { have = true; break; }
+      if(have) continue;
+      if(!SymbolSelect(sym, true)) continue;
+      int hf = iMA(sym, InTimeframe, InEmaFast, 0, MODE_EMA, PRICE_CLOSE);
+      int hs = iMA(sym, InTimeframe, InEmaSlow, 0, MODE_EMA, PRICE_CLOSE);
+      int hr = iRSI(sym, InTimeframe, InRsiPeriod, PRICE_CLOSE);
+      int ha = iATR(sym, InTimeframe, InAtrPeriod);
+      if(hf == INVALID_HANDLE || hs == INVALID_HANDLE ||
+         hr == INVALID_HANDLE  || ha == INVALID_HANDLE)
+      {
+         Print("NovaSignals: indicator handle failed on retry, skipping: ", sym);
+         continue;
+      }
+      g_symbols[g_nsym]  = sym;
+      g_hFast[g_nsym]    = hf;
+      g_hSlow[g_nsym]    = hs;
+      g_hRsi[g_nsym]     = hr;
+      g_hAtr[g_nsym]     = ha;
+      g_lastBar[g_nsym]  = iTime(sym, InTimeframe, 0);
+      g_lastSigBar[g_nsym] = 0;
+      g_nsym++;
+      added++;
+   }
+   if(added > 0)
+      Print("NovaSignals: recovered ", added, " symbols post-restart, total=", g_nsym);
+}
+
+//+------------------------------------------------------------------+
 int OnInit()
 {
    string parts[];
    int total = LoadSymbolList(parts);
    g_nsym = 0;
-   for(int k = 0; k < total && g_nsym < MAX_SYM; k++)
+   g_nmaster = 0;
+   for(int k = 0; k < total && g_nmaster < MAX_SYM; k++)
    {
       string sym = parts[k];
       StringTrimLeft(sym);
       StringTrimRight(sym);
       if(StringLen(sym) == 0) continue;
+      g_master[g_nmaster++] = sym;   // remember every requested symbol
+      if(g_nsym >= MAX_SYM) continue;
       if(!SymbolSelect(sym, true))
       {
-         Print("NovaSignals: symbol not carried by broker, skipping: ", sym);
+         Print("NovaSignals: symbol not carried by broker (will retry): ", sym);
          continue;
       }
       int hf = iMA(sym, InTimeframe, InEmaFast, 0, MODE_EMA, PRICE_CLOSE);
@@ -109,7 +168,8 @@ int OnInit()
       Print("NovaSignals: no usable symbols, init failed");
       return(INIT_FAILED);
    }
-   Print("NovaSignals: watching ", g_nsym, " symbols on ", EnumToString(InTimeframe));
+   Print("NovaSignals: watching ", g_nsym, "/", g_nmaster, " symbols on ",
+         EnumToString(InTimeframe));
    return(INIT_SUCCEEDED);
 }
 
@@ -263,6 +323,12 @@ void WriteHeartbeat()
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   if(TimeGMT() - g_lastRetry >= 60)
+   {
+      g_lastRetry = TimeGMT();
+      EnsureSymbols();
+   }
+
    for(int i = 0; i < g_nsym; i++)
       CheckSymbol(i);
 
