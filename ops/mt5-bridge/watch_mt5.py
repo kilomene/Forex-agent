@@ -192,11 +192,41 @@ def ensure_wine():
 
 
 def relaunch():
+    """Run the MT5 launcher. Never raises.
+
+    A launcher that exceeds its timeout is killed (its own PID only -- never
+    pattern-matched). The backgrounded terminal itself is never touched here:
+    nohup orphans it through the launcher's death, and the caller re-checks
+    terminal liveness afterwards.
+
+    NOTE (2026-10-13): the old belt-and-braces
+    ``pkill -f "run-mt5-tunnel[.]sh"`` was REMOVED. It caused friendly fire:
+    supervisor ticks are 5 min apart but a launch can legitimately take
+    minutes (the two WinInet reg calls hang ~4 min each when run without the
+    LD_PRELOAD shim -- observed 2026-10-12), so a timed-out tick's cleanup
+    SIGKILLed the NEXT tick's fresh launcher mid-flight (incident 2026-10-13
+    12:24-12:34 UTC). p.kill() already SIGKILLs our own launcher
+    (uncatchable); orphaned reg helpers finish late but are idempotent, and
+    the launcher spawns terminal64 only once, so no duplicate-terminal hazard
+    exists. Pattern-based process kills are banned in this module -- a kill
+    must always be PID-scoped to the process we launched.
+    """
+    # 600s: the reg-add helpers can each stall ~4 min without the shim;
+    # a relaunch that launches the terminal then waits on them is healthy.
     log("relaunching MT5 via run-mt5-tunnel.sh")
-    r = subprocess.run(["bash", LAUNCHER], capture_output=True, text=True,
-                       timeout=120)
-    log("launcher exit=%d tail=%s" % (r.returncode, r.stdout[-300:]))
-    return r.returncode == 0
+    try:
+        p = subprocess.Popen(["bash", LAUNCHER], stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True)
+        out, _ = p.communicate(timeout=600)
+    except subprocess.TimeoutExpired:
+        log("launcher timed out after 600s; killing orphaned launcher")
+        try:
+            p.kill()
+        except Exception:  # noqa: BLE001 - best effort
+            pass
+        return False
+    log("launcher exit=%d tail=%s" % (p.returncode, out[-300:]))
+    return p.returncode == 0
 
 
 def gui_reattach():
