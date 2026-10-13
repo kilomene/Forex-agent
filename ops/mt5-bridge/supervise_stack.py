@@ -175,11 +175,47 @@ def heal_terminal():
     return True
 
 
+def _market_open():
+    """FX market-hours gate: True when quotes should be flowing.
+
+    Falls back to True (old behaviour: always require a fresh feed) when
+    market_hours is unavailable, so a missing helper can never mask a real
+    outage.
+    """
+    try:
+        import market_hours
+        from datetime import datetime, timezone, timedelta
+        # Log the server-time basis for the verdict: on 2026-10-13 several
+        # ticks logged "market closed (weekend)" on a Tuesday while others
+        # correctly reported open. Recording the computed server time with
+        # every verdict makes the next occurrence diagnosable instead of
+        # a mystery.
+        server_now = datetime.now(timezone.utc) + timedelta(
+            hours=market_hours.SERVER_UTC_OFFSET_H)
+        verdict = bool(market_hours.is_market_open())
+        log("market-hours verdict: open=%s server_time=%s weekday=%d" % (
+            verdict, server_now.strftime("%Y-%m-%d %H:%M:%S"),
+            server_now.weekday()))
+        return verdict
+    except Exception:
+        return True
+
+
 def heal_feed():
     """Ensure the quote feed is fresh (EA attached). Best-effort re-attach.
 
+    When the FX market is closed (weekend), NovaSignals' heartbeat can never
+    fire -- its writer is OnTick-only and there are no ticks while the
+    market is closed -- so a stale feed is expected and healthy, not a
+    failure. Skipping the check avoids a false HARD FAILURE and a pointless
+    GUI re-attach on every supervisor tick all weekend.
+
     Returns True when the feed is fresh afterwards, False on hard failure.
     """
+    if not _market_open():
+        log("feed check skipped: FX market closed (weekend); stale feed "
+            "expected")
+        return True
     fresh, detail = watch_mt5.feed_fresh()
     if fresh:
         return True
@@ -340,7 +376,10 @@ def main(argv):
     if actions:
         log("healed: %s" % "; ".join(actions))
     else:
-        fresh, detail = watch_mt5.feed_fresh()
+        if not _market_open():
+            detail = "feed gated: market closed (weekend)"
+        else:
+            _, detail = watch_mt5.feed_fresh()
         log("healthy: terminal up; %s; all daemons alive" % detail)
     return 0
 
