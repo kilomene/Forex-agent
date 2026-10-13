@@ -1964,9 +1964,17 @@ class TraderEngine:
         """
         cmd_id = rec.get("command_id")
         for ev in trades:
-            if ev.get("command_id") == cmd_id and ev.get("type") in (
-                    "trade.opened", "trade.rejected", "trade.closed"):
+            if ev.get("command_id") != cmd_id:
+                continue
+            etype = ev.get("type")
+            if etype in ("trade.opened", "trade.closed"):
                 return False
+            if etype == "trade.rejected":
+                # A rejection is definitive proof the order did NOT
+                # execute. (_reconcile_entry closes these out as terminal
+                # "rejected" before reaching here; this keeps the proof
+                # predicate honest if it ever does.)
+                continue
         if rec.get("cmd_type") == "trade.open":
             if not positions_fresh:
                 return False  # stale broker view: cannot prove absence
@@ -1993,11 +2001,44 @@ class TraderEngine:
         via supersedes_key), unless the disconnect halt or an already-
         used resend forbids it. Inconclusive -> leave unknown.
         """
+        from idempotency import PENDING_STATUSES
+        if (rec.get("status") or "") not in PENDING_STATUSES:
+            # Already terminal (filled/rejected/failed/abandoned): nothing
+            # to reconcile; never re-journal.
+            return rec.get("status")
         positions, positions_fresh = (
             positions_provider() if positions_provider
             else self._read_broker_positions())
         trades = (trades_provider() if trades_provider
                   else self._read_recent_trades())
+        # A broker REJECTION with our command_id is definitive proof the
+        # order never executed -- and it is also not adoptable. Before this
+        # terminal check existed (2026-10-13), rejected commands sat in
+        # "unknown" forever: _proves_no_execution() treated trade.rejected
+        # as blocking, so sweep_timeouts() re-journaled
+        # execution.reconcile_deferred for every stuck entry on EVERY 5s
+        # main-loop cycle (117k+ journal lines of pure noise).
+        rejected_ev = None
+        for ev in trades:
+            if (ev.get("type") == "trade.rejected"
+                    and ev.get("command_id") == rec.get("command_id")):
+                rejected_ev = ev
+                break
+        if rejected_ev is not None:
+            self.idem.update(key, status="rejected",
+                             rejected_at=utcnow_iso())
+            self.journal({
+                "type": "execution.rejected_confirmed",
+                "command_id": rec.get("command_id"),
+                "cmd_type": rec.get("cmd_type"),
+                "idempotency_key": key,
+                "reason": rejected_ev.get("reason")
+                          or "broker rejected the order; terminal state, "
+                             "no resend",
+            })
+            log(f"RECONCILED (rejected): {rec.get('command_id')} broker "
+                f"rejected the order -- terminal, NOT resent")
+            return "rejected"
         evidence = None
         if rec.get("cmd_type") == "trade.open":
             evidence = self._evidence_for_open(rec, positions, trades)
@@ -2027,16 +2068,29 @@ class TraderEngine:
             return "adopted"
         if not self._proves_no_execution(rec, positions, trades,
                                          positions_fresh):
-            self.journal({
-                "type": "execution.reconcile_deferred",
-                "command_id": rec.get("command_id"),
-                "cmd_type": rec.get("cmd_type"),
-                "idempotency_key": key,
-                "reason": "broker state inconclusive; leaving unknown, "
-                          "no resend",
-            })
-            log(f"RECONCILE DEFERRED: {rec.get('command_id')} broker state "
-                f"inconclusive -- left unknown, NOT resent")
+            # Dedup the deferral journal: a still-inconclusive entry would
+            # otherwise emit execution.reconcile_deferred on EVERY 5s
+            # main-loop cycle (the 2026-10-13 journal flood). Journal at
+            # most one deferral per entry per hour; the status stays
+            # "unknown" and reconcile is retried regardless.
+            now = datetime.now(timezone.utc)
+            last = parse_iso(rec.get("last_deferral_journaled_at"))
+            journal_it = (last is None
+                          or (now - last).total_seconds() >= 3600)
+            if journal_it:
+                self.idem.update(
+                    key,
+                    last_deferral_journaled_at=now.isoformat())
+                self.journal({
+                    "type": "execution.reconcile_deferred",
+                    "command_id": rec.get("command_id"),
+                    "cmd_type": rec.get("cmd_type"),
+                    "idempotency_key": key,
+                    "reason": "broker state inconclusive; leaving unknown, "
+                              "no resend",
+                })
+                log(f"RECONCILE DEFERRED: {rec.get('command_id')} broker "
+                    f"state inconclusive -- left unknown, NOT resent")
             return "deferred"
         if self.disconnect_halt:
             self.journal({
