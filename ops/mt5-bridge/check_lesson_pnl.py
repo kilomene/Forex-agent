@@ -41,7 +41,7 @@ TOLERANCE = 0.015  # cents: figures are rounded to 2dp
 #   "SL hit at 0.9392 after ~37 minutes (-105.08, ...)"
 #   "exit = entry 3803.62 -> 0.0" / "-> +20,162.64 banked"
 _PNL_PATTERNS = [
-    re.compile(r"realized\s+(?:net\s+|loss\s+)?\(?(-?\$?[\d,]+\.\d{2})\)?", re.I),
+    re.compile(r"realized\s+(?:net\s+|loss\s+)?\(?([+-]?\$?[\d,]+\.\d{2})\)?", re.I),
     re.compile(r"([+-]\$?[\d,]+\.\d{2})\s+banked", re.I),
     re.compile(r"loss\s+\(?(-?\$?[\d,]+\.\d{2})\)?", re.I),
     re.compile(
