@@ -117,6 +117,121 @@ def dpkg_status(pkg):
     return r.stdout.strip()
 
 
+# Dpkg/apt lock files. After a host reboot the platform's os-intent replay
+# holds these for its own pass (15-30 min); any dpkg/apt-get call we make
+# meanwhile fails instantly with a lock error -- exactly what burned all
+# install rounds in ~2 s on 2026-10-13 ~23:11 UTC and forced a manual
+# recovery. Detect the holder and wait instead of failing blind.
+APT_LOCK_FILES = ("/var/lib/dpkg/lock-frontend", "/var/lib/dpkg/lock",
+                  "/var/lib/apt/lists/lock",
+                  "/var/cache/apt/archives/lock")
+
+
+def run_logged(cmd, timeout, tag):
+    """Run cmd, capturing output; log rc + stderr tail on failure.
+
+    Previously every dpkg/apt-get call swallowed its own output, so a
+    failed reinstall left no trace of WHY. Now the tail lands in the
+    watchdog log for post-mortem.
+    """
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        err = (r.stderr or "").strip().splitlines()
+        out = (r.stdout or "").strip().splitlines()
+        tail = " | ".join((err + out)[-8:])
+        log("%s rc=%d: %s" % (tag, r.returncode, tail[:600]))
+    return r
+
+
+def apt_lock_holder():
+    """Return (locked, description) for the dpkg/apt lock files."""
+    holders = []
+    for lf in APT_LOCK_FILES:
+        try:
+            r = subprocess.run(["fuser", lf], capture_output=True,
+                               text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return False, "fuser unavailable; cannot check lock state"
+        pids = r.stdout.strip()
+        if r.returncode == 0 and pids:
+            try:
+                names = subprocess.run(
+                    ["ps", "-o", "comm=", "-p", pids.replace(" ", ",")],
+                    capture_output=True, text=True,
+                    timeout=10).stdout.strip().replace("\n", ",")
+            except (OSError, subprocess.SubprocessError):
+                names = "?"
+            holders.append("%s held by %s (%s)" % (lf, pids, names))
+    return (bool(holders), "; ".join(holders))
+
+
+def wait_for_apt_lock(timeout_s=240, poll_s=10):
+    """Wait for the dpkg/apt lock to free, bounded by timeout_s.
+
+    Returns True when free, False on timeout. The bound keeps a stuck
+    holder from hanging the 5-min watchdog tick forever; the next tick
+    retries.
+    """
+    end = time.time() + timeout_s
+    while True:
+        locked, desc = apt_lock_holder()
+        if not locked:
+            return True
+        if time.time() >= end:
+            log("apt lock still held after %ds: %s" % (timeout_s, desc))
+            return False
+        log("apt lock held (%s); waiting for release" % desc)
+        time.sleep(poll_s)
+
+
+# Substrings that identify a dpkg/apt failure as lock contention with the
+# platform's os-intent replay (or any concurrent package operation),
+# rather than a real packaging error. Matched against stderr+stdout of a
+# failed dpkg/apt-get call.
+LOCK_ERROR_PATTERNS = (
+    "could not get lock",
+    "unable to acquire the dpkg frontend lock",
+    "dpkg frontend lock was locked",
+    "unable to lock",
+)
+
+
+def is_lock_error(text):
+    """True when a dpkg/apt failure output describes lock contention."""
+    t = (text or "").lower()
+    return any(p in t for p in LOCK_ERROR_PATTERNS)
+
+
+def run_logged_lock_retry(cmd, timeout, tag, lock_retries=2,
+                          lock_wait_s=240):
+    """Like run_logged, but a lock-contention failure waits and retries.
+
+    Post-reboot reality (2026-10-14 ~20:41 UTC): the os-intent replay can
+    grab the dpkg lock in the TOCTOU window between ensure_wine's
+    pre-install wait_for_apt_lock() and the actual dpkg rounds -- or hold
+    it longer than one wait. The old code then burned every install round
+    and the apt-get fallback in ~1 second and reported FAILED, even though
+    the holder released minutes later. This wrapper re-waits on a lock
+    error and retries the step, so a transient lock costs time, not the
+    whole recovery. Bounded: after lock_retries the last result stands and
+    the next supervisor tick retries the whole ensure_wine.
+    """
+    r = run_logged(cmd, timeout, tag)
+    for attempt in range(lock_retries):
+        if r.returncode == 0:
+            return r
+        if not is_lock_error((r.stderr or "") + "\n" + (r.stdout or "")):
+            return r
+        log("%s hit dpkg/apt lock contention; waiting for holder "
+            "(retry %d/%d)" % (tag, attempt + 1, lock_retries))
+        if not wait_for_apt_lock(timeout_s=lock_wait_s):
+            log("%s: lock still held after wait; not retrying further"
+                % tag)
+            return r
+        r = run_logged(cmd, timeout, tag)
+    return r
+
+
 def ensure_wine():
     """Reinstall Wine after a reboot wiped it.
 
@@ -129,6 +244,10 @@ def ensure_wine():
         return True
     log("wine missing after reboot; reinstalling")
     try:
+        # Never fight the os-intent replay for the dpkg lock: wait for its
+        # PID to exit, then install. (2026-10-13 ~23:11 UTC: all install
+        # rounds + the apt-get fallback burned in ~2 s on the lock.)
+        wait_for_apt_lock()
         debs = []
         for deb_dir in (WINE_DEB_DIR, APT_CACHE):
             for name in WINE_DEBS:
@@ -143,11 +262,13 @@ def ensure_wine():
                     debs.append(hits[0])
         if debs:
             for round_no in range(3):
-                subprocess.run(
-                    ["dpkg", "-i"] + debs, capture_output=True, text=True,
-                    timeout=300)
-                subprocess.run(["dpkg", "--configure", "-a"],
-                               capture_output=True, text=True, timeout=180)
+                # Lock-retrying: the replay can grab the dpkg lock between
+                # our pre-install wait and the rounds (TOCTOU) -- see
+                # run_logged_lock_retry.
+                run_logged_lock_retry(["dpkg", "-i"] + debs, 300,
+                                      "ensure_wine dpkg -i")
+                run_logged_lock_retry(["dpkg", "--configure", "-a"], 180,
+                                      "ensure_wine dpkg --configure")
                 # A working wine64 binary is the real gate: dpkg status can
                 # stay "unpacked" over a pure packaging pedantry (the
                 # os-intent replay installs libelf1t64 from noble-updates,
@@ -156,26 +277,33 @@ def ensure_wine():
                     break
                 log("ensure_wine round %d: wine64 status=%s" %
                     (round_no, dpkg_status("wine64")))
-            if dpkg_status("wine64") != "installed" and wine_ok():
-                # Binary works but packages left unconfigured: force past
-                # the version-pin mismatch once so the dpkg database is
-                # clean for future operations. The newer libelf1t64
-                # satisfies the real ABI need of libdw1t64.
-                r = subprocess.run(
+            if dpkg_status("wine64") != "installed":
+                # Binary works but packages left unconfigured, OR the config
+                # rounds failed on the libelf1t64/libdw1t64 version-pin
+                # mismatch: force past it once so the dpkg database is clean
+                # (or unblocked) for future operations. The newer libelf1t64
+                # satisfies the real ABI need of libdw1t64 (proven 2026-09-23,
+                # 2026-10-11). Previously this pass was gated on wine_ok(),
+                # which is dead code when the pin mismatch blocks the binary
+                # itself -- the force pass never ran and ensure_wine FAILED.
+                r = run_logged_lock_retry(
                     ["dpkg", "--configure", "-a", "--force-depends-version"],
-                    capture_output=True, text=True, timeout=180)
+                    180, "ensure_wine dpkg --force-depends-version")
                 log("ensure_wine force-depends-version pass rc=%d" %
                     r.returncode)
+                run_logged_lock_retry(["dpkg", "--configure", "-a"], 180,
+                                      "ensure_wine dpkg --configure (post-force)")
         else:
             log("ensure_wine: no local debs available; trying apt-get")
         if not wine_ok():
             log("ensure_wine: falling back to apt-get install")
-            subprocess.run(
+            wait_for_apt_lock()
+            run_logged_lock_retry(
                 ["apt-get", "install", "-y", "--no-install-recommends",
                  "wine64", "xdotool"],
-                capture_output=True, text=True, timeout=600)
-            subprocess.run(["dpkg", "--configure", "-a"],
-                           capture_output=True, text=True, timeout=180)
+                600, "ensure_wine apt-get install")
+            run_logged_lock_retry(["dpkg", "--configure", "-a"], 180,
+                                  "ensure_wine dpkg --configure (post-apt)")
         try:
             if os.path.islink(WINE_LINK) or not os.path.exists(WINE_LINK):
                 if os.path.islink(WINE_LINK):
