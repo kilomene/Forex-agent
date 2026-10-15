@@ -52,7 +52,8 @@ def iso(tmp_path, monkeypatch):
 
 def write_specs(files, *, login=LOGIN, server=SERVER, acct_type="DEMO",
                 age_s=0, symbols=None):
-    t = (datetime.now() - timedelta(seconds=age_s)).strftime("%Y.%m.%d %H:%M:%S")
+    # specs "time" is UTC by contract (EA writes TimeGMT()); fabricate in UTC.
+    t = (datetime.now(timezone.utc) - timedelta(seconds=age_s)).strftime("%Y.%m.%d %H:%M:%S")
     account = {"equity": 1_000_000.0, "balance": 1_000_000.0,
                "currency": "USD", "server": server, "time": t}
     if login is not None:
@@ -77,7 +78,9 @@ def _sig(**over):
     s = {"id": "XPDUSD_M15_BUY_1790028000", "type": "signal.detected",
          "symbol": "XPDUSD", "timeframe": "M15", "direction": "BUY",
          "entry_price": 1310.914, "stop_loss": 1306.344,
-         "take_profit": 1320.054}
+         "take_profit": 1320.054,
+         "candle_time": datetime.now(timezone.utc).strftime(
+             "%Y.%m.%d %H:%M:%S")}
     s.update(over)
     return s
 

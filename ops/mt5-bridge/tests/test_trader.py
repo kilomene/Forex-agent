@@ -2,7 +2,7 @@
 import json
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta, timezone
 
 import pytest
 
@@ -72,9 +72,16 @@ def sig(**over):
         "entry_price": 1310.914,
         "stop_loss": 1306.344,
         "take_profit": 1320.054,
+        "candle_time": datetime.now(timezone.utc).strftime("%Y.%m.%d %H:%M:%S"),
     }
     s.update(over)
     return s
+
+
+# Fresh candle_time for fixture signals (2026-10-15): the stale-signal
+# gate rejects signals older than max_signal_age_hours, so fixtures that
+# test OTHER gates must carry a current timestamp.
+_FRESH_CANDLE = datetime.now(timezone.utc).strftime("%Y.%m.%d %H:%M:%S")
 
 
 FIXTURE_SIGNALS = [
@@ -82,7 +89,7 @@ FIXTURE_SIGNALS = [
         "id": "XPDUSD_M15_BUY_1790028000", "type": "signal.detected",
         "symbol": "XPDUSD", "timeframe": "M15", "direction": "BUY",
         "entry_price": 1310.914, "stop_loss": 1306.344,
-        "take_profit": 1320.054, "candle_time": "2026.09.21 22:00:00",
+        "take_profit": 1320.054, "candle_time": _FRESH_CANDLE,
         "strategy": "ema_rsi",
         # Repair round 2 (2026-09-24): the advisory veto is always on, so
         # live "commanded" paths need a TRADE advisory -- these carry
@@ -94,7 +101,7 @@ FIXTURE_SIGNALS = [
         "id": "BAC_M15_BUY_1790027100", "type": "signal.detected",
         "symbol": "BAC", "timeframe": "M15", "direction": "BUY",
         "entry_price": 58.23, "stop_loss": 58.04,
-        "take_profit": 58.61, "candle_time": "2026.09.21 21:45:00",
+        "take_profit": 58.61, "candle_time": _FRESH_CANDLE,
         "strategy": "ema_rsi",
         "ema_fast": 58.3, "ema_slow": 58.1,
         "rsi_value": 58, "atr_value": 0.1,
@@ -103,7 +110,7 @@ FIXTURE_SIGNALS = [
         "id": "XPTUSD_M15_BUY_1790028900", "type": "signal.detected",
         "symbol": "XPTUSD", "timeframe": "M15", "direction": "BUY",
         "entry_price": 1807.751, "stop_loss": 1802.491,
-        "take_profit": 1818.27, "candle_time": "2026.09.21 22:15:00",
+        "take_profit": 1818.27, "candle_time": _FRESH_CANDLE,
         "strategy": "ema_rsi",
         "ema_fast": 1808.5, "ema_slow": 1807.0,
         "rsi_value": 52, "atr_value": 3.0,
@@ -128,7 +135,9 @@ def make_sandbox(tmp_path, *, trading_enabled=True, dry_run=True):
     state = tmp_path / "run"
     files.mkdir()
     state.mkdir()
-    now = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+    # specs "time" is UTC by contract (EA writes TimeGMT()); fabricate in UTC
+    # so freshness checks behave the same on any host timezone.
+    now = datetime.now(timezone.utc).strftime("%Y.%m.%d %H:%M:%S")
     specs = {
         "time": now,
         "account": {"equity": 1_000_000.0, "balance": 1_000_000.0,
@@ -199,6 +208,172 @@ def test_compute_volume_bad_specs_tick_size_zero():
     assert err == "skipped:bad_specs"
 
 
+def test_compute_volume_tick_value_override_xagusd():
+    """Racheal engagement #2: broker reports XAGUSD tick_value=0.5 but true
+    value is 5.0 (verified against realized P&L). Override must be used."""
+    # Without override: uses broker's wrong 0.5 -> 10x oversized volume
+    v_wrong, _, err = te.compute_volume(
+        200_000.0, 0.05, 66.015, 65.701,
+        spec(tick_size=0.001, tick_value=0.5, volume_min=0.01,
+             volume_max=100.0, volume_step=0.01),
+        symbol="XAGUSD")
+    assert err is None
+    # With override: uses correct 5.0 -> 10x smaller (correct) volume
+    v_fixed, _, err = te.compute_volume(
+        200_000.0, 0.05, 66.015, 65.701,
+        spec(tick_size=0.001, tick_value=0.5, volume_min=0.01,
+             volume_max=100.0, volume_step=0.01),
+        tick_value_overrides={"XAGUSD": 5.0},
+        symbol="XAGUSD")
+    assert err is None
+    # Override gives 10x smaller volume (0.06 vs 0.63, floored to step 0.01)
+    assert v_fixed < v_wrong / 9.0
+    assert v_fixed > v_wrong / 11.0
+    # The fixed volume should risk ~$100, not ~$1000
+    # risk=$100, sl=314 ticks, tv=$5.00 -> vol = 100/(314*5) = 0.0637 -> 0.06
+
+
+def test_compute_volume_tick_value_override_xauusd():
+    """Racheal engagement #2: broker reports XAUUSD tick_value=0.1 but true
+    value is 1.0. Override must be used."""
+    v_wrong, _, _ = te.compute_volume(
+        200_000.0, 0.05, 2650.0, 2640.0,
+        spec(tick_size=0.01, tick_value=0.1, volume_min=0.01,
+             volume_max=100.0, volume_step=0.01),
+        symbol="XAUUSD")
+    v_fixed, _, err = te.compute_volume(
+        200_000.0, 0.05, 2650.0, 2640.0,
+        spec(tick_size=0.01, tick_value=0.1, volume_min=0.01,
+             volume_max=100.0, volume_step=0.01),
+        tick_value_overrides={"XAUUSD": 1.0},
+        symbol="XAUUSD")
+    assert err is None
+    assert v_fixed == pytest.approx(v_wrong / 10.0, rel=0.01)
+
+
+def test_compute_volume_no_override_uses_broker_value():
+    """Without an override for the symbol, broker tick_value is used."""
+    v, _, err = te.compute_volume(
+        20_000.0, 0.5, 5.0, 4.0,
+        spec(tick_size=0.5, tick_value=2.0, volume_min=0.5,
+             volume_max=100.0, volume_step=0.5),
+        tick_value_overrides={"XAGUSD": 5.0},
+        symbol="EURUSD")
+    assert err is None
+    assert v == 25.0  # Same as test_compute_volume_exact (no override applied)
+
+
+# --- Racheal engagement #4: EA tick_value validation + contract_size
+# cross-check (resolve_tick_value). The broker misreports tick_value by
+# 10x on metals; the EA now validates and publishes contract_size.
+
+
+def test_resolve_tick_value_override_wins_over_ea_invalid():
+    """Manual override beats the EA's tick_value_ok=false (XAGUSD case)."""
+    tv, err = te.resolve_tick_value(
+        spec(tick_value=0.5, tick_size=0.001, contract_size=5000.0,
+             tick_value_ok=False, tick_value_note="mismatch",
+             profit_currency="USD"),
+        "XAGUSD",
+        tick_value_overrides={"XAGUSD": 5.0})
+    assert err is None
+    assert tv == 5.0
+
+
+def test_resolve_tick_value_ea_invalid_no_override_refuses():
+    """EA-flagged invalid tick_value with no override -> refuse sizing."""
+    tv, err = te.resolve_tick_value(
+        spec(tick_value=0.5, tick_size=0.001, contract_size=5000.0,
+             tick_value_ok=False, tick_value_note="mismatch",
+             profit_currency="USD"),
+        "XAGUSD")
+    assert err == "skipped:bad_specs"
+    assert tv == 0.0
+
+
+def test_resolve_tick_value_crosscheck_catches_10x_misreport():
+    """Independent check: reported 0.5 vs expected 0.001*5000=5.0 -> refuse,
+    even if the EA's flag were missing or wrong."""
+    tv, err = te.resolve_tick_value(
+        spec(tick_value=0.5, tick_size=0.001, contract_size=5000.0,
+             tick_value_ok=True, profit_currency="USD"),
+        "XAGUSD")
+    assert err == "skipped:bad_specs"
+    assert tv == 0.0
+
+
+def test_resolve_tick_value_crosscheck_valid_passes():
+    """EURUSD: reported 1.0 == 1e-05*100000 -> use reported value."""
+    tv, err = te.resolve_tick_value(
+        spec(tick_value=1.0, tick_size=1e-05, contract_size=100000.0,
+             tick_value_ok=True, profit_currency="USD"),
+        "EURUSD")
+    assert err is None
+    assert tv == 1.0
+
+
+def test_resolve_tick_value_crosscheck_within_tolerance():
+    """Small deviations (<=10%) pass -- not every broker rounds identically."""
+    tv, err = te.resolve_tick_value(
+        spec(tick_value=1.05, tick_size=1e-05, contract_size=100000.0,
+             tick_value_ok=True, profit_currency="USD"),
+        "EURUSD")
+    assert err is None
+    assert tv == 1.05
+
+
+def test_resolve_tick_value_cross_currency_skips_check():
+    """Cross-currency symbols (profit != account ccy) skip the exact check;
+    blocked_symbols (Eng #3) is the guard for those."""
+    tv, err = te.resolve_tick_value(
+        spec(tick_value=0.63, tick_size=0.001, contract_size=100000.0,
+             tick_value_ok=True, profit_currency="JPY"),
+        "USDJPY")
+    assert err is None
+    assert tv == 0.63
+
+
+def test_resolve_tick_value_legacy_specs_unaffected():
+    """Pre-fix specs (no new fields) behave exactly as before."""
+    tv, err = te.resolve_tick_value(spec(tick_value=2.0), "EURUSD")
+    assert err is None
+    assert tv == 2.0
+
+
+def test_compute_volume_ea_invalid_blocks_sizing():
+    """End-to-end: EA says invalid, no override -> skipped:bad_specs."""
+    _, _, err = te.compute_volume(
+        200_000.0, 0.05, 66.015, 65.701,
+        spec(tick_size=0.001, tick_value=0.5, contract_size=5000.0,
+             tick_value_ok=False, profit_currency="USD",
+             volume_min=0.01, volume_max=100.0, volume_step=0.01),
+        symbol="XAGUSD")
+    assert err == "skipped:bad_specs"
+
+
+def test_compute_volume_crosscheck_blocks_garbage_without_override():
+    """End-to-end: 10x misreport caught by the independent cross-check
+    even with no override configured and no EA flag."""
+    _, _, err = te.compute_volume(
+        200_000.0, 0.05, 66.015, 65.701,
+        spec(tick_size=0.001, tick_value=0.5, contract_size=5000.0,
+             profit_currency="USD",
+             volume_min=0.01, volume_max=100.0, volume_step=0.01),
+        symbol="XAGUSD")
+    assert err == "skipped:bad_specs"
+
+
+def test_compute_volume_crosscheck_valid_sizes_correctly():
+    """End-to-end: validated specs size exactly as before."""
+    v, _, err = te.compute_volume(
+        20_000.0, 0.5, 5.0, 4.0,
+        spec(tick_size=0.5, tick_value=2.0, contract_size=4.0,
+             tick_value_ok=True, profit_currency="USD",
+             volume_min=0.5, volume_max=100.0, volume_step=0.5))
+    assert err is None
+    assert v == 25.0  # 0.5*4.0=2.0 == reported -> same as legacy
+
+
 def test_compute_volume_bad_specs_no_sl_distance():
     _, _, err = te.compute_volume(
         10_000.0, 0.5, 1.1, 1.1, spec())
@@ -225,6 +400,19 @@ def test_compute_volume_clamps_to_max():
 def test_gate_trading_disabled():
     d, _ = te.check_gates(sig(), **gate_ctx(enabled=False, dry_run=True))
     assert d == "skipped:trading_disabled"
+
+
+def test_gate_symbol_blocked():
+    """Racheal engagement #3: symbols with unverifiable tick_values
+    (XAUCHF, XAUGBP, XAGEUR, XAUEUR) are blocked from trading."""
+    d, flags = te.check_gates(
+        sig(symbol="XAUCHF"),
+        **gate_ctx(blocked_symbols=["XAUCHF", "XAUGBP", "XAGEUR", "XAUEUR"]))
+    assert d == "skipped:symbol_blocked"
+    assert flags.get("loud") is True
+    # Unblocked symbol passes this gate
+    d2, _ = te.check_gates(sig(), **gate_ctx(blocked_symbols=["XAUCHF"]))
+    assert d2 != "skipped:symbol_blocked"
 
 
 def test_gate_stale_specs():
@@ -696,7 +884,7 @@ def test_load_trade_state_open_minus_closed(tmp_path):
 
 def test_specs_stale_after_300s(tmp_path):
     files, state = make_sandbox(tmp_path, trading_enabled=True, dry_run=True)
-    old = (datetime.now() - timedelta(seconds=400)).strftime("%Y.%m.%d %H:%M:%S")
+    old = (datetime.now(timezone.utc) - timedelta(seconds=400)).strftime("%Y.%m.%d %H:%M:%S")
     specs = json.load(open(os.path.join(files, "nova_symbol_specs.json")))
     specs["time"] = old
     json.dump(specs, open(os.path.join(files, "nova_symbol_specs.json"), "w"))

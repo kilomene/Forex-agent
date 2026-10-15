@@ -3,7 +3,7 @@
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -53,6 +53,7 @@ def sig(**over):
         # indicator data (RR 2.0).
         "ema_fast": 1311.5, "ema_slow": 1310.0,
         "rsi_value": 55, "atr_value": 2.0,
+        "candle_time": datetime.now(timezone.utc).strftime("%Y.%m.%d %H:%M:%S"),
     }
     s.update(over)
     return s

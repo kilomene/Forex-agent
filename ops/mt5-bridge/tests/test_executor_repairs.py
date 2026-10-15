@@ -4,7 +4,7 @@ import json
 import math
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -71,6 +71,7 @@ def sig(**over):
         "entry_price": 1310.914,
         "stop_loss": 1306.344,
         "take_profit": 1320.054,
+        "candle_time": datetime.now(timezone.utc).strftime("%Y.%m.%d %H:%M:%S"),
     }
     s.update(over)
     return s
@@ -433,3 +434,46 @@ def test_mirror_idempotent_across_restart(tmp_path):
     closes = [e for e in read_journal(state)
               if e.get("type") == "trade.closed"]
     assert len(closes) == 1
+
+
+# ---------------------------------------------------------------- stale-signal gate (2026-10-15)
+
+def _old_candle(hours_ago):
+    from datetime import timedelta
+    return (datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+            ).strftime("%Y.%m.%d %H:%M:%S")
+
+
+def test_stale_signal_rejected():
+    # Regression: on 2026-10-15 a 2026-09-23 EURDKK signal (22 days old)
+    # was executed (-$150.02) after the signals file was re-read from
+    # offset 0 and the 500-entry `seen` dedup had aged the ID out.
+    # Signals older than max_signal_age_hours must be refused.
+    s = sig(candle_time=_old_candle(22 * 24))
+    d, flags = te.check_gates(s, **gate_ctx(max_signal_age_hours=2.0))
+    assert d == "skipped:stale_signal"
+    assert flags.get("loud") is True
+
+
+def test_fresh_signal_passes_gate():
+    # A signal from 30 minutes ago must NOT trip the freshness gate
+    # (it may still be skipped by a later gate, but not this one).
+    s = sig(candle_time=_old_candle(0.5))
+    d, _ = te.check_gates(s, **gate_ctx(max_signal_age_hours=2.0))
+    assert d != "skipped:stale_signal"
+
+
+def test_missing_candle_time_fails_closed():
+    # Without a verifiable candle_time the signal cannot be proven fresh.
+    s = sig()
+    del s["candle_time"]
+    d, flags = te.check_gates(s, **gate_ctx(max_signal_age_hours=2.0))
+    assert d == "skipped:stale_signal"
+    assert flags.get("loud") is True
+
+
+def test_stale_gate_disabled_when_zero():
+    # max_signal_age_hours=0 disables the gate (backwards compatibility).
+    s = sig(candle_time=_old_candle(22 * 24))
+    d, _ = te.check_gates(s, **gate_ctx(max_signal_age_hours=0))
+    assert d != "skipped:stale_signal"

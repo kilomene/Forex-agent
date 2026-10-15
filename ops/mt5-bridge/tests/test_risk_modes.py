@@ -7,6 +7,7 @@ re-instantiation, day roll) and the new check_gates M0-M6 gates
 import json
 import os
 import sys
+from datetime import datetime, timezone
 
 import pytest
 
@@ -68,6 +69,7 @@ def sig(**over):
         "symbol": "XPDUSD", "timeframe": "M15", "direction": "BUY",
         "entry_price": 1310.914, "stop_loss": 1306.344,
         "take_profit": 1320.054,
+        "candle_time": datetime.now(timezone.utc).strftime("%Y.%m.%d %H:%M:%S"),
     }
     s.update(over)
     return s

@@ -146,18 +146,39 @@ DEFAULT_CONFIG = {
                                    # founder approval file.
     "emergency_drawdown_pct": 3.0, # Worker C 2026-09-23: per-mode emergency
                                    # drawdown that trips the kill switch.
+    # Racheal engagement #2 (2026-10-09): broker tick_value misreporting.
+    # MetaQuotes-Demo reports SYMBOL_TRADE_TICK_VALUE 10x too small for
+    # XAUUSD (0.1 vs true 1.0) and XAGUSD (0.5 vs true 5.0), verified
+    # against realized P&L from broker deal history. The executor must
+    # not trust these values blindly. Overrides map symbol -> correct
+    # USD tick_value per 1.0 lot per 1 tick. Empty dict = no overrides.
+    "tick_value_overrides": {},
+    # Racheal engagement #3 (2026-10-09): symbols with unverifiable or
+    # nonsensical broker tick_values are blocked from trading entirely.
+    # XAUCHF (1203.66), XAUGBP (1323.69), XAGEUR (1.12135), XAUEUR (1.12135)
+    # all report garbage tick_values. Fail closed until the EA publishes
+    # correct values (requires Zenas-authorized recompile).
+    "blocked_symbols": [],
     # Owner order 2026-10-13 ("close any profit that is plunging, with
     # immediate effect"): profit-plunge guard. Tracks peak unrealized
     # profit per bot position from the broker positions feed; when a
     # position that peaked at or above profit_plunge_arm_usd gives back
     # so much that its current profit falls to profit_plunge_keep_pct
-    # (or less) of that peak, the executor immediately sends a
+    # (or less) of its peak, the executor immediately sends a
     # trade.close command (reason "profit_plunge"). This is a PROTECTIVE
     # close: it runs every loop even when new entries are halted and is
     # never gated by the kill switch or trading_enabled.
     "profit_plunge_guard": True,
     "profit_plunge_arm_usd": 100.0,
     "profit_plunge_keep_pct": 0.5,
+    # Safety gate (2026-10-15): maximum age of a signal's candle_time in
+    # hours. Signals older than this are never executed. Root cause:
+    # the signals file can be re-read from offset 0 after truncation and
+    # the 500-entry `seen` dedup ages out old signal IDs, so ancient
+    # signals get re-evaluated; on 2026-10-15 a 2026-09-23 EURDKK signal
+    # was executed (-$150.02). Always on (integrity gate, not an
+    # opportunity filter).
+    "max_signal_age_hours": 2.0,
 }
 
 SPECS_MAX_AGE_S = 300
@@ -629,14 +650,74 @@ def _mrs_get(state, key, default=None):
     return default
 
 
-def compute_volume(equity, risk_pct, entry, stop_loss, spec):
+def resolve_tick_value(spec, symbol, tick_value_overrides=None,
+                       account_currency="USD"):
+    """
+    Racheal engagement #4 (2026-10-09): cross-validate the broker's
+    reported tick_value against the contract_size the EA now publishes.
+    Defense in depth -- does NOT trust the EA's tick_value_ok flag alone.
+
+    Returns (tick_value, error). error is None on success or
+    "skipped:bad_specs".
+
+    Precedence:
+      1. Manual tick_value_overrides win (authoritative human correction,
+         e.g. XAUUSD/XAGUSD 10x misreport).
+      2. EA-flagged invalid (tick_value_ok == false) with no override
+         -> refuse.
+      3. Independent check: when profit_currency == account currency,
+         expected = tick_size * contract_size exactly; a reported value
+         more than 10% off -> refuse. Verified against EURUSD
+         (1e-05 * 100000 = $1.00 = reported).
+      4. Otherwise use the reported tick_value (legacy behavior; specs
+         predating the EA fix lack the new fields and default to ok).
+    """
+    overrides = tick_value_overrides or {}
+    if symbol and symbol in overrides:
+        return overrides[symbol], None
+    reported = spec.get("tick_value") or 0
+    # EA-side verdict (absent in pre-fix specs -> default ok).
+    if spec.get("tick_value_ok", True) is False:
+        return 0.0, "skipped:bad_specs"
+    # Independent cross-check for same-currency symbols.
+    profit_ccy = (spec.get("profit_currency") or "").upper()
+    acct_ccy = (account_currency or "USD").upper()
+    tick_size = spec.get("tick_size") or 0
+    contract_size = spec.get("contract_size") or 0
+    if profit_ccy and profit_ccy == acct_ccy and tick_size > 0 \
+            and contract_size > 0:
+        expected = tick_size * contract_size
+        if expected > 0 and reported > 0:
+            ratio = reported / expected
+            if ratio < 0.9 or ratio > 1.1:
+                return 0.0, "skipped:bad_specs"
+    return reported, None
+
+
+def compute_volume(equity, risk_pct, entry, stop_loss, spec, tick_value_overrides=None,
+                   symbol=None, account_currency="USD"):
     """
     Return (volume, risk_amount, error). error is None on success or one of
     "skipped:bad_specs", "skipped:volume_below_min".
+
+    tick_value_overrides: optional dict mapping symbol -> corrected USD
+    tick_value per 1.0 lot per tick. Used when the broker misreports
+    SYMBOL_TRADE_TICK_VALUE (Racheal engagement #2: XAUUSD/XAGUSD 10x).
+    symbol: the trading symbol, used to look up overrides.
+    account_currency: the account currency for the tick_value cross-check
+    (Racheal engagement #4); defaults to USD.
+    The tick_value is resolved through resolve_tick_value (Racheal
+    engagement #4): EA verdict + independent contract_size cross-check.
     """
     risk_amount = equity * risk_pct / 100.0
     tick_size = spec.get("tick_size") or 0
-    tick_value = spec.get("tick_value") or 0
+    # Racheal fix: resolve the tick_value through validation before
+    # trusting broker data.
+    tick_value, tv_err = resolve_tick_value(
+        spec, symbol, tick_value_overrides=tick_value_overrides,
+        account_currency=account_currency)
+    if tv_err:
+        return 0.0, risk_amount, tv_err
     sl_dist = abs((entry or 0) - (stop_loss or 0))
     sl_ticks = sl_dist / tick_size if tick_size else 0
     if sl_ticks <= 0 or tick_value <= 0:
@@ -838,7 +919,10 @@ def check_gates(sig, *, enabled, dry_run, specs, specs_fresh,
                 free_margin=None, margin_level=None,
                 max_risk_per_trade_usd=MAX_RISK_PER_TRADE_USD,
                 emergency_drawdown_pct=EMERGENCY_DRAWDOWN_PCT,
-                price_reference=None):
+                price_reference=None,
+                tick_value_overrides=None,
+                blocked_symbols=None,
+                max_signal_age_hours=2.0):
     """
     Run the risk gates in order; first failure wins.
     Returns (decision, flags) where flags may carry loud/trip side effects.
@@ -874,6 +958,32 @@ def check_gates(sig, *, enabled, dry_run, specs, specs_fresh,
     # 1. not enabled (config or kill switch)
     if not enabled:
         return "skipped:trading_disabled", {}
+
+    # 1a0. Signal freshness (2026-10-15): never execute a signal whose
+    # candle_time is older than max_signal_age_hours. The signals file can
+    # be re-read from offset 0 after truncation and the 500-entry `seen`
+    # dedup ages out old signal IDs, so ancient signals get re-evaluated
+    # (2026-10-15: a 2026-09-23 EURDKK signal was executed, -$150.02).
+    # candle_time is broker time = UTC (see TZ bug class, 2026-10-12).
+    # Unparseable/missing candle_time fails closed: without a verifiable
+    # age the signal cannot be proven fresh.
+    if max_signal_age_hours and max_signal_age_hours > 0:
+        candle_time = sig.get("candle_time")
+        try:
+            ct = datetime.strptime(
+                str(candle_time), "%Y.%m.%d %H:%M:%S").replace(
+                    tzinfo=timezone.utc)
+        except (ValueError, TypeError, AttributeError):
+            return "skipped:stale_signal", {"loud": True}
+        age_h = (datetime.now(timezone.utc) - ct).total_seconds() / 3600.0
+        if age_h > max_signal_age_hours:
+            return "skipped:stale_signal", {"loud": True}
+
+    # 1a. Racheal engagement #3 (2026-10-09): blocked symbols fail closed.
+    # Symbols with unverifiable broker tick_values cannot be sized safely.
+    blocked = blocked_symbols or []
+    if symbol in blocked:
+        return "skipped:symbol_blocked", {"loud": True}
 
     # 1b. owner-allocated capital basis (2026-09-22): fail closed. A basis
     # that is None, non-numeric, non-finite, or non-positive means the
@@ -937,7 +1047,13 @@ def check_gates(sig, *, enabled, dry_run, specs, specs_fresh,
     # so stale/missing specs and sizing failures journal their skip reason.
     if not specs_fresh or spec is None:
         return "skipped:stale_specs", {}
-    volume, risk_amount, err = compute_volume(sizing_equity, risk_pct, entry, sl, spec)
+    acct_ccy = ((specs.get("account") or {}).get("currency") or "USD") \
+        if specs else "USD"
+    volume, risk_amount, err = compute_volume(
+        sizing_equity, risk_pct, entry, sl, spec,
+        tick_value_overrides=tick_value_overrides,
+        symbol=sig.get("symbol"),
+        account_currency=acct_ccy)
     if err:
         return err, {}
 
@@ -1477,6 +1593,12 @@ class TraderEngine:
         Freshness is judged on the specs' own "time" field against
         max_age_s (default SPECS_MAX_AGE_S). Callers that need a stricter
         bar (startup validation, identity lock) pass a smaller window.
+
+        The EA writes "time" from TimeGMT() (UTC) by construction, so the
+        comparison clock is UTC explicitly -- naive datetime.now() follows
+        the host TZ (e.g. TZ=Africa/Lagos) and produced a permanent ~3600s
+        false-stale on any non-UTC host (2026-10-12: startup refused with
+        6-second-fresh specs).
         """
         try:
             with open(self.paths["specs"]) as f:
@@ -1484,7 +1606,10 @@ class TraderEngine:
         except (OSError, ValueError):
             return None, False
         dt = parse_mt5_time(specs.get("time"))
-        fresh = bool(dt and (datetime.now() - dt).total_seconds() <= max_age_s)
+        if dt is not None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        fresh = bool(dt and (now - dt).total_seconds() <= max_age_s)
         return specs, fresh
 
     def _open_info_for(self, ev):
@@ -1859,7 +1984,10 @@ class TraderEngine:
         if feed:
             st = parse_mt5_time(feed.get("server_time") or feed.get("time"))
             if st is not None:
-                ages.append((datetime.now() - st).total_seconds())
+                # feed server_time is UTC (EA TimeGMT); naive now() follows
+                # host TZ and would inflate the age by the UTC offset.
+                st = st.replace(tzinfo=timezone.utc)
+                ages.append((datetime.now(timezone.utc) - st).total_seconds())
         return max(ages) if ages else float("inf")
 
     def check_disconnect(self):
@@ -2485,6 +2613,9 @@ class TraderEngine:
             emergency_drawdown_pct=cfg.get("emergency_drawdown_pct",
                                           EMERGENCY_DRAWDOWN_PCT),
             price_reference=sig.get("entry_price"),
+            tick_value_overrides=cfg.get("tick_value_overrides", {}),
+            blocked_symbols=cfg.get("blocked_symbols", []),
+            max_signal_age_hours=cfg.get("max_signal_age_hours", 2.0),
         )
         return decision, flags
 

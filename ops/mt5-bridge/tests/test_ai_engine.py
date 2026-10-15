@@ -7,6 +7,7 @@ stages running in the documented order.
 """
 import os
 import sys
+from datetime import datetime, timezone
 
 BRIDGE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BRIDGE)
@@ -257,7 +258,9 @@ def _wiring_sandbox(tmp_path):
                     "balance": 200000.0}}
     sig = {"id": "X1", "type": "signal.detected", "symbol": "XPDUSD",
            "timeframe": "M15", "direction": "BUY", "entry_price": 1310.914,
-           "stop_loss": 1306.344, "take_profit": 1320.054}
+           "stop_loss": 1306.344, "take_profit": 1320.054,
+           "candle_time": datetime.now(timezone.utc).strftime(
+               "%Y.%m.%d %H:%M:%S")}
     return eng, cfg, specs, sig, run, files
 
 
