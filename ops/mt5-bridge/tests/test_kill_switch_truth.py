@@ -106,15 +106,31 @@ def test_journal_timestamps_are_utc_by_construction(tmp_path):
     try:
         os.environ["TZ"] = "America/New_York"
         _time.tzset()
-        utc_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        assert te.now_str() == utc_now
-        assert risk_state._now_str() == utc_now
+
+        def _parse_utc(s):
+            return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=timezone.utc)
+
+        # Exact-second equality with a pre-captured stamp is a clock race:
+        # the second can tick over between capture and stamping (observed
+        # on CI: '20:18:09' vs '20:18:08'). Assert instead that every
+        # stamper produces a time within tolerance of true UTC now --
+        # under TZ=America/New_York, host-local stamping would be ~4h
+        # off and fail loudly, which is the actual property under test.
+        before = datetime.now(timezone.utc)
+        stamps = [te.now_str(), risk_state._now_str()]
         run = str(tmp_path / "run")
         os.makedirs(run)
         shadow_tracker.journal(run, {"type": "probe"})
         with open(os.path.join(run, "nova_journal.jsonl")) as f:
             ev = json.loads(f.readline())
-        assert ev["time"] == utc_now
+        stamps.append(ev["time"])
+        after = datetime.now(timezone.utc)
+        lo = before.timestamp() - 2
+        hi = after.timestamp() + 2
+        for s in stamps:
+            ts = _parse_utc(s).timestamp()
+            assert lo <= ts <= hi, f"stamp {s!r} not within tolerance of UTC now"
     finally:
         if old_tz is None:
             os.environ.pop("TZ", None)
