@@ -68,6 +68,35 @@ def test_healthy_symbol_not_excluded(tmp_path):
     assert not [p for p in rep["proposals"] if p["key"] == "blocked_symbols"]
 
 
+def test_duplicate_close_rows_count_once(tmp_path):
+    # 2026-10-15: the journal held 2-5 byte-identical trade.closed rows per
+    # ticket (mirror re-links). Stats must count each ticket exactly once,
+    # like daily_summary's per-ticket contract, or n/totals inflate ~2-5x.
+    now = datetime.now(timezone.utc)
+    evs = []
+    for i in range(16):
+        for _ in range(3):  # triplicate every close
+            evs.append(closed(900000 + i, "CHFJPY", -250.0,
+                              when=now - timedelta(days=1)))
+    _, _, jp = sandbox(tmp_path, evs)
+    got = st.load_closed_trades(jp, lookback_days=30, now=now)
+    assert len(got) == 16
+    stats = st.symbol_stats(got)
+    assert stats["CHFJPY"]["n"] == 16
+    assert stats["CHFJPY"]["total"] == pytest.approx(-4000.0)
+
+
+def test_duplicate_close_last_record_wins(tmp_path):
+    # A later re-link carrying a corrected pnl supersedes the earlier row.
+    now = datetime.now(timezone.utc)
+    evs = [closed(900001, "CHFJPY", -250.0, when=now - timedelta(days=2)),
+           closed(900001, "CHFJPY", -260.0, when=now - timedelta(days=1))]
+    _, _, jp = sandbox(tmp_path, evs)
+    got = st.load_closed_trades(jp, lookback_days=30, now=now)
+    assert len(got) == 1
+    assert got[0]["pnl"] == pytest.approx(-260.0)
+
+
 def test_risk_scales_down_on_bleed(tmp_path):
     now = datetime.now(timezone.utc)
     evs = [closed(i, "EURUSD", -150.0, when=now - timedelta(days=1))

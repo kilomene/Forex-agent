@@ -371,3 +371,19 @@ def test_json_cannot_serialize_set_documents_why_lists():
     json.dump(set(...)) raises TypeError -- the original crash-loop class."""
     with pytest.raises(TypeError):
         json.dumps({"trades_seen": {("a", "b")}})
+
+
+def test_do_backup_no_prune_on_failure(tmp_path):
+    """Racheal engagement #3: if a backup captures 0 files (all sources
+    missing), old snapshots must NOT be pruned."""
+    backup_root = tmp_path / "backups"
+    backup_root.mkdir()
+    # Create 3 old snapshots
+    for i in range(3):
+        (backup_root / f"2020010{i}-000000").mkdir()
+    # Run backup with no valid source files
+    dest = bt.do_backup(backup_root=str(backup_root), snapshot_files=[])
+    # All 3 old snapshots + the new (empty) one must still exist
+    remaining = [d for d in os.listdir(str(backup_root))
+                 if os.path.isdir(os.path.join(str(backup_root), d))]
+    assert len(remaining) == 4

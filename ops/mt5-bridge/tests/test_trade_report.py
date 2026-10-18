@@ -293,6 +293,37 @@ def test_end_to_end_privacy_fail_on_leaked_deal(tmp_path, monkeypatch):
     assert rc == 1, "run must FAIL (non-zero exit) on leaked deal ticket"
 
 
+def test_end_to_end_own_open_deal_not_flagged(tmp_path, monkeypatch):
+    # Regression (2026-10-13): trade 10925768340's page named its own
+    # open-side deal (trade.opened "deal") in its lesson note, and the
+    # privacy gate flagged it because own_ids() only knew the close-side
+    # deal fields. The open-side deal IS the trade's own identifier, so
+    # naming it on its own page must pass the gate.
+    own_deal = "98222222222"
+    out = tmp_path / "out"
+    j = tmp_path / "journal.jsonl"
+    j.write_text(_journal_lines(
+        {"type": "trade.opened", "ticket": int(FAKE_TICKET), "symbol": "XAUAUD",
+         "direction": "SELL", "volume": 0.15, "entry_price": 5998.67,
+         "deal": int(own_deal),
+         "time": "2026.10.13 14:30:07", "signal_id": "SIG1"}))
+    monkeypatch.setattr(rep, "JOURNAL_PATH", str(j))
+    monkeypatch.setattr(rep, "TRADES_PATH", str(tmp_path / "nope.jsonl"))
+    monkeypatch.setattr(rep, "SIGNALS_PATH", str(tmp_path / "nope2.jsonl"))
+    monkeypatch.setattr(rep, "POSITIONS_PATH", str(tmp_path / "nope3.json"))
+    monkeypatch.setattr(rep, "load_lessons", lambda *a, **k: {
+        FAKE_TICKET: {"ref": FAKE_TICKET, "kind": "trade",
+                      "created_at": "2026-10-13", "author": "T6",
+                      "why_entered": "signal", "why_exited": "unclear",
+                      "what_worked": "entry", "what_failed": "exit unclear",
+                      "what_to_change": "check broker history for deal "
+                                        f"{own_deal} this week"}})
+    rc = rep.main(["--out", str(out)])
+    assert rc == 0, "own open-side deal named on its own page must pass"
+    page = (out / "2026-10-13" / f"{FAKE_TICKET}.md").read_text()
+    assert own_deal in page
+
+
 def test_end_to_end_clean_mixed_classes(tmp_path, monkeypatch):
     out = tmp_path / "out"
     j = tmp_path / "journal.jsonl"

@@ -34,10 +34,21 @@ def test_friday_late_open_saturday_early_closed():
     assert mh.is_market_open(dt(5, 23, 59)) is False
 
 
-def test_sunday_before_01_closed_after_open():
+def test_sunday_all_day_closed():
+    """Racheal engagement #3: FX is closed all of Sunday server time.
+    Opens Sunday 22:00 GMT = Monday 01:00 server. The old code wrongly
+    reported OPEN from Sunday 01:00."""
     assert mh.is_market_open(dt(6, 0, 30)) is False
-    assert mh.is_market_open(dt(6, 1, 0)) is True
-    assert mh.is_market_open(dt(6, 12, 0)) is True
+    assert mh.is_market_open(dt(6, 1, 0)) is False
+    assert mh.is_market_open(dt(6, 12, 0)) is False
+    assert mh.is_market_open(dt(6, 23, 59)) is False
+
+
+def test_monday_before_01_closed_after_open():
+    """Monday before 01:00 server is still closed (FX opens 22:00 GMT Sunday)."""
+    assert mh.is_market_open(dt(0, 0, 30)) is False
+    assert mh.is_market_open(dt(0, 1, 0)) is True
+    assert mh.is_market_open(dt(0, 12, 0)) is True
 
 
 def test_saturday_early_morning_boundary():

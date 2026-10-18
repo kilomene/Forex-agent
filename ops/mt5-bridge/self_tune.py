@@ -91,14 +91,22 @@ def load_closed_trades(journal_path, lookback_days=LOOKBACK_DAYS, now=None):
 
     Effective P&L prefers net_profit (incl. commission/swap) over profit,
     mirroring the executor's eff_profit().
+
+    Each ticket counts exactly once (last record wins): the journal can
+    hold byte-identical duplicate trade.closed rows for one ticket when
+    the trades-file mirror re-links the same close, so counting raw rows
+    inflates n and totals ~2-5x (seen 2026-10-15: 46/49 same-day tickets
+    duplicated). Mirrors daily_summary's per-ticket contract. Ticketless
+    closes are kept as-is (each counted on its own).
     """
     now = now or datetime.now(timezone.utc)
     cutoff = now - timedelta(days=lookback_days)
-    out = []
+    by_ticket = {}
+    ticketless = []
     try:
         f = open(journal_path, encoding="utf-8", errors="replace")
     except OSError:
-        return out
+        return []
     with f:
         for line in f:
             line = line.strip()
@@ -133,10 +141,19 @@ def load_closed_trades(journal_path, lookback_days=LOOKBACK_DAYS, now=None):
             sym = ev.get("symbol")
             if not isinstance(sym, str) or not sym:
                 sym = "UNKNOWN"
-            out.append({"ticket": ev.get("ticket"), "symbol": sym,
-                        "direction": ev.get("direction"), "pnl": pnl,
-                        "time": ts})
-    return out
+            rec = {"ticket": ev.get("ticket"), "symbol": sym,
+                   "direction": ev.get("direction"), "pnl": pnl,
+                   "time": ts}
+            ticket = ev.get("ticket")
+            if ticket is None or ticket == "":
+                ticketless.append(rec)
+            else:
+                key = str(ticket)
+                if key in by_ticket:
+                    # Re-insert so the latest record keeps newest-last order.
+                    del by_ticket[key]
+                by_ticket[key] = rec
+    return ticketless + list(by_ticket.values())
 
 
 def symbol_stats(closed):

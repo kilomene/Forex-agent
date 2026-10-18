@@ -30,8 +30,12 @@ SERVER_UTC_OFFSET_H = 3
 
 # Closed window: (weekday, start_hour) .. (weekday, end_hour), server time.
 # Monday=0 ... Sunday=6. All of Saturday is closed (conservative rule).
+# Racheal engagement #3 (2026-10-09): FIXED — CLOSED_TO was (6, 1) Sunday
+# 01:00, but FX opens Sunday 22:00 GMT = Monday 01:00 server. The old code
+# reported the market OPEN for all of Sunday, 24h early. Correct close:
+# Saturday 00:00 server through Monday 01:00 server.
 CLOSED_FROM = (5, 0)   # Saturday 00:00
-CLOSED_TO = (6, 1)     # Sunday   01:00
+CLOSED_TO = (0, 1)     # Monday   01:00
 
 
 def session_bucket(server_hour):
@@ -57,10 +61,15 @@ def is_market_open(server_dt=None):
             hours=SERVER_UTC_OFFSET_H)
     wd = server_dt.weekday()          # Monday=0
     hh = server_dt.hour + server_dt.minute / 60.0
-    # closed all of Saturday (inclusive) until Sunday 01:00 (exclusive)
+    # Closed: all of Saturday (wd=5), all of Sunday (wd=6), and Monday
+    # before 01:00 (wd=0, hh<1). Racheal engagement #3: the old code only
+    # closed Sunday before 01:00, wrongly reporting OPEN for the rest of
+    # Sunday when FX is actually closed until Sunday 22:00 GMT.
     if wd == 5:
         return False
-    if wd == 6 and hh < CLOSED_TO[1]:
+    if wd == 6:
+        return False
+    if wd == 0 and hh < CLOSED_TO[1]:
         return False
     return True
 

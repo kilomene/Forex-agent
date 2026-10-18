@@ -276,6 +276,11 @@ def build_trades(journal, broker_trades, signals, positions):
             "signal": sig,
             "decision": decisions.get(sid),
             "close": close,
+            # The broker's opening deal ID (executor records it as "deal" on
+            # trade.opened). It is this trade's own identifier: evidence
+            # pages and lesson notes may name it, so it must be allowlisted
+            # by own_ids() just like the close-side deal IDs.
+            "deal": o.get("deal"),
             "open_source": o.get("_source"),
             "_open_line": o.get("_open_line"),
             "_close_lines": (close or {}).get("_close_lines") or [],
@@ -1137,6 +1142,7 @@ def own_ids(tr):
     sig = tr.get("signal") or {}
     c = tr.get("close") or {}
     for v in (tr.get("ticket"), tr.get("signal_id"), tr.get("command_id"),
+              tr.get("deal"),  # open-side deal from trade.opened
               sig.get("signal_id"), sig.get("id"),
               c.get("deal_in"), c.get("deal_out"), c.get("deal_id"),
               c.get("deal_entry"), c.get("order_id"), c.get("position_id")):
