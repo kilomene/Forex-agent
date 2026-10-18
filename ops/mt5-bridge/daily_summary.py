@@ -16,6 +16,9 @@ import os
 import sys
 from datetime import datetime, timezone
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import performance  # noqa: E402  (single honest-metrics implementation)
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 STATE_DIR = os.environ.get("TRADER_STATE_DIR", os.path.join(BASE, "run"))
 MEMORY_DIR = os.environ.get("MEMORY_DIR", os.path.expanduser("~/memory"))
@@ -52,65 +55,51 @@ def event_date(ev):
 def _eff_profit(ev):
     """Authoritative P&L for one close event.
 
-    net_profit (gross profit + commission + swap) is preferred over the
-    bare profit field. Mirrors trade_executor.eff_profit() (gate
-    accounting) and experiment._eff_profit() (experiment record) so the
-    daily summary agrees with both.
+    Delegates to performance.effective_profit (the single implementation).
+    Kept as a module-level name because weekend_reflection and final_report
+    call daily_summary._eff_profit.
     """
-    for k in ("net_profit", "profit"):
-        try:
-            v = float(ev.get(k))
-        except (TypeError, ValueError):
-            continue
-        if v == v:  # not NaN
-            return v
-    return 0.0
+    return performance.effective_profit(ev)
 
 
 def _close_date(ev):
     """Day attribution for a close event.
 
-    A trade.close_corrected revision carries the authoritative broker
-    exit time; otherwise the event's own time. Dotted MT5 timestamps and
+    Delegates to performance.close_date (the single implementation). A
+    trade.close_corrected revision carries the authoritative broker exit
+    time; otherwise the event's own time. Dotted MT5 timestamps and
     dashed ISO both normalize to YYYY-MM-DD.
     """
-    t = ev.get("exit_time_broker") or ev.get("time")
-    return str(t or "")[:10].replace(".", "-")
+    return performance.close_date(ev)
 
 
 def summarize_day(journal, today):
     """Per-ticket effective P&L for one day.
 
-    A trade.close_corrected revision supersedes that ticket's provisional
-    trade.closed (its swap/commission-corrected net wins) REGARDLESS of
-    journal order: a late provisional close can never clobber an earlier
-    correction (repair round 2, 2026-09-24). Each ticket counts exactly
-    once, dated by its authoritative close time. Closes with no ticket
-    are quarantined individually -- they are never merged into one
-    bucket (old code keyed them all as str(None)).
-    Returns (day_pnl, profits).
+    Delegates the per-ticket dedup to performance.dedupe_closes (the single
+    implementation of the repair-round-2 rule: a trade.close_corrected
+    revision supersedes that ticket's provisional trade.closed REGARDLESS
+    of journal order; ticketless closes kept individually), then filters to
+    the given day by authoritative close date. Returns (day_pnl, profits).
     """
-    closes = {}  # ticket -> [date, pnl, is_correction]
-    ticketless = []  # [(date, pnl)] -- each counted on its own
-    for e in journal:
-        t = e.get("type")
-        if t not in ("trade.closed", "trade.close_corrected"):
-            continue
-        is_correction = (t == "trade.close_corrected")
-        ticket = e.get("ticket")
-        date, pnl = _close_date(e), _eff_profit(e)
-        if ticket is None or ticket == "":
-            ticketless.append((date, pnl))
-            continue
-        key = str(ticket)
-        prev = closes.get(key)
-        if prev is None or is_correction or not prev[2]:
-            # A correction always wins (any order); a provisional close
-            # only replaces another provisional (last-wins, as before).
-            closes[key] = (date, pnl, is_correction)
-    profits = [pnl for (d, pnl, _c) in closes.values() if d == today]
-    profits += [pnl for (d, pnl) in ticketless if d == today]
+    unique, _raw = performance.dedupe_closes(journal)
+    profits = [performance.effective_profit(e) for e in unique
+               if performance.close_date(e) == today]
     return sum(profits), profits
+
+
+def _metrics_tail(metrics, dup):
+    """Memory-line tail with the new performance numbers.
+
+    Appended to the existing summary line format (which stays untouched);
+    all values come from performance.compute_metrics / duplication_check.
+    """
+    pf = metrics.get("profit_factor")
+    pf_s = f"{pf:.2f}" if pf is not None else "n/a"
+    dd = metrics["max_drawdown"]["max_drawdown"]
+    dup_s = f"DUP-FLAGGED ({dup['reason']})" if dup["flagged"] else "dup-check clean"
+    return (f" Sharpe {metrics['sharpe_ratio']:+.2f}, PF {pf_s}, "
+            f"maxDD {dd:.2f}, {dup_s}.")
 
 
 def main(journal_path=JOURNAL_PATH, today=None, memory_dir=MEMORY_DIR):
@@ -135,6 +124,12 @@ def main(journal_path=JOURNAL_PATH, today=None, memory_dir=MEMORY_DIR):
     expectancy = (day_pnl / len(profits)) if profits else 0.0
     win_rate = (wins / len(profits) * 100) if profits else 0.0
 
+    # Honest performance block (Freqtrade-style report, phase 1): metrics
+    # over the same deduped per-trade series the P&L above uses, plus the
+    # by-construction duplication guard against another inflated headline.
+    metrics = performance.compute_metrics(profits)
+    dup = performance.duplication_check(journal)
+
     summary = {
         "type": "daily_summary",
         "date": today,
@@ -146,6 +141,8 @@ def main(journal_path=JOURNAL_PATH, today=None, memory_dir=MEMORY_DIR):
         "day_pnl": round(day_pnl, 2),
         "win_rate_pct": round(win_rate, 1),
         "expectancy": round(expectancy, 2),
+        "performance": metrics,
+        "duplication_check": dup,
         "kill_switch_trips": len(trips),
         "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -156,7 +153,8 @@ def main(journal_path=JOURNAL_PATH, today=None, memory_dir=MEMORY_DIR):
             f"{len(signals)} signals, {len(profits)} trades closed, "
             f"P&L {day_pnl:+.2f}, win rate {win_rate:.1f}%, "
             f"expectancy {expectancy:+.2f}/trade, "
-            f"kill-switch trips {len(trips)}.")
+            f"kill-switch trips {len(trips)}."
+            f"{_metrics_tail(metrics, dup)}")
     os.makedirs(memory_dir, exist_ok=True)
     mem_path = os.path.join(memory_dir, f"{today}.md")
     with open(mem_path, "a") as f:

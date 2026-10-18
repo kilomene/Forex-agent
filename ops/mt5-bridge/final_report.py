@@ -17,9 +17,26 @@ import sys
 from collections import defaultdict
 from datetime import datetime
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import daily_summary  # noqa: E402  (per-ticket dedup rule, repair round 2)
+import performance  # noqa: E402  (single dedup implementation, phase 1)
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 STATE_DIR = os.environ.get("TRADER_STATE_DIR", os.path.join(BASE, "run"))
 JOURNAL_PATH = os.path.join(STATE_DIR, "nova_journal.jsonl")
+
+
+def dedup_closed(journal):
+    """One event per broker ticket (the honest close count).
+
+    Delegates to performance.dedupe_closes (the single implementation of
+    the repair-round-2 rule shared with daily_summary and
+    weekend_reflection): a trade.close_corrected revision supersedes that
+    ticket's provisional trade.closed, regardless of journal order; closes
+    with no ticket are kept as their own events.
+    Returns (unique_events, raw_event_count).
+    """
+    return performance.dedupe_closes(journal)
 
 
 def load_journal():
@@ -68,27 +85,18 @@ def main():
     signals = [e for e in journal if e.get("type") == "signal.received"]
     decisions = [e for e in journal if e.get("type") == "trade.decision"]
     opened = [e for e in journal if e.get("type") == "trade.opened"]
-    closed = [e for e in journal if e.get("type") == "trade.closed"]
+    closed, raw_close_events = dedup_closed(journal)
     trips = [e for e in journal if e.get("type") == "kill_switch.tripped"]
     cfg_changes = [e for e in journal if e.get("type") == "config.changed"]
     reflections = [e for e in journal if e.get("type") == "reflection"]
     dailies = [e for e in journal if e.get("type") == "daily_summary"]
 
-    profits = []
-    for e in closed:
-        try:
-            profits.append(float(e.get("profit") or 0))
-        except (TypeError, ValueError):
-            pass
+    profits = [daily_summary._eff_profit(e) for e in closed]
     o = stats(profits)
 
     by_symbol = defaultdict(list)
     by_dir = defaultdict(list)
-    for e in closed:
-        try:
-            p = float(e.get("profit") or 0)
-        except (TypeError, ValueError):
-            continue
+    for e, p in zip(closed, profits):
         by_symbol[e.get("symbol") or "?"].append(p)
         by_dir[e.get("direction") or "?"].append(p)
 
@@ -117,6 +125,8 @@ def main():
     L.append(f"| Decisions journaled | {len(decisions)} |")
     L.append(f"| Trades opened | {len(opened)} |")
     L.append(f"| Trades closed | {len(closed)} |")
+    L.append(f"| Journaled close events (incl. duplicates) | "
+             f"{raw_close_events} |")
     L.append(f"| Wins / Losses | {o['wins']} / {o['losses']} |")
     L.append(f"| Win rate | {o['win_rate']:.1f}% |")
     L.append(f"| Total P&L | {m(o['total'])} |")
@@ -153,21 +163,24 @@ def main():
     L.append("")
     L.append("## Every closed trade")
     L.append("")
-    L.append("| # | Time | Symbol | Dir | Vol | Entry | Exit | P&L | "
+    L.append("One row per broker ticket — journaled duplicates (mirrored / "
+             "reconciled close events) are collapsed to a single row, with a "
+             "trade.close_corrected revision winning over the provisional "
+             "close.")
+    L.append("")
+    L.append("| # | Ticket | Time | Symbol | Dir | Vol | Entry | Exit | P&L | "
              "Hold | Reason |")
-    L.append("|---|---|---|---|---|---|---|---|---|---|---|")
+    L.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
     for i, e in enumerate(sorted(closed, key=lambda x: str(x.get("time"))),
                                  1):
         hold = e.get("hold_seconds")
         hold_s = f"{hold // 60}m" if isinstance(hold, int) else "?"
-        try:
-            p = float(e.get("profit") or 0)
-        except (TypeError, ValueError):
-            p = 0.0
-        L.append(f"| {i} | {e.get('time', '?')} | {e.get('symbol', '?')} | "
-                 f"{e.get('direction', '?')} | {e.get('volume', '?')} | "
-                 f"{e.get('entry_price', '?')} | {e.get('exit_price', '?')} | "
-                 f"{m(p)} | {hold_s} | {e.get('reason', '?')} |")
+        p = daily_summary._eff_profit(e)
+        L.append(f"| {i} | {e.get('ticket', '?')} | {e.get('time', '?')} | "
+                 f"{e.get('symbol', '?')} | {e.get('direction', '?')} | "
+                 f"{e.get('volume', '?')} | {e.get('entry_price', '?')} | "
+                 f"{e.get('exit_price', '?')} | {m(p)} | {hold_s} | "
+                 f"{e.get('reason', '?')} |")
     L.append("")
     L.append("## Config history")
     L.append("")
