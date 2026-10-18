@@ -827,7 +827,12 @@ def test_journal_linkage_rejected(tmp_path):
 
 # ---------------------------------------------------------------- live-mode side effects
 
-def test_daily_loss_limit_trips_kill_switch_live(tmp_path):
+def test_daily_loss_limit_trips_kill_switch_live(tmp_path, monkeypatch):
+    # Hermetic against the market-hours gate: this test is about the
+    # daily-loss kill trip, not the session clock. Without the stub it
+    # fails every weekend (skipped:market_closed) and passes on weekdays.
+    monkeypatch.setattr(te.market_hours, "is_market_open",
+                        lambda *a, **k: True)
     files, state = make_sandbox(tmp_path, trading_enabled=True, dry_run=False)
     today = datetime.now().strftime("%Y.%m.%d")
     (os.path.join(files, "nova_trades.jsonl"))
@@ -848,7 +853,11 @@ def test_daily_loss_limit_trips_kill_switch_live(tmp_path):
     assert decs[0]["decision"] == "skipped:daily_loss_limit"
 
 
-def test_live_mode_writes_command_and_journals_commanded(tmp_path):
+def test_live_mode_writes_command_and_journals_commanded(tmp_path, monkeypatch):
+    # Hermetic against the market-hours gate (see above): without the
+    # stub this test fails every weekend and passes on weekdays.
+    monkeypatch.setattr(te.market_hours, "is_market_open",
+                        lambda *a, **k: True)
     files, state = make_sandbox(tmp_path, trading_enabled=True, dry_run=False)
     eng = te.TraderEngine(files_dir=files, state_dir=state)
     decisions = eng.run_once()

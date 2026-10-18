@@ -462,12 +462,23 @@ def test_kill_switch_resume_version_refused_at_scan(
 
 
 def test_auto_behavior_version_proceeds_past_tier_gate(
-        fake_bridge, fake_state):
+        fake_bridge, fake_state, monkeypatch):
     # A behavior-change proposal in tier auto is NOT refused at the tier
     # gate: it runs the fixed gate order (scan ok, gate (a) green). In
     # this sandbox it then halts at gate (b) because the fake bridge has
     # no trade_executor for the replay runner -- an environmental limit,
     # not a tier refusal.
+    #
+    # Hermeticity: gate (b) first looks for the EA's live specs file
+    # (~/workspace/mt5/.../nova_symbol_specs.json), which exists on the
+    # dev host but not on CI. Point the lookup at a fake specs file so
+    # the test reaches the replay-runner step on every machine.
+    from pipeline import staging
+    specs = os.path.join(fake_state, "nova_symbol_specs.json")
+    with open(specs, "w") as f:
+        json.dump({"account": {"equity": 100000, "balance": 100000},
+                   "symbols": {}}, f)
+    monkeypatch.setattr(staging, "_specs_path", lambda bridge: specs)
     b, s = fake_bridge, fake_state
     vid = "v0005-auto-behavior"
     fdir = os.path.join(b, "versions", vid, "files")

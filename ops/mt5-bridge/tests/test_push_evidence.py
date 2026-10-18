@@ -24,6 +24,20 @@ import pytest
 import push_evidence as pe
 
 
+@pytest.fixture(autouse=True)
+def _stub_dynamic_credentials(monkeypatch):
+    """gh_api() lazy-imports the host-only dynamic_credentials helper
+    (connector surrogate auth). Stub it so the network-path tests run
+    hermetically on any machine — including CI, where the helper does
+    not exist. The stub mirrors the real read_json_response contract
+    (JSON-decode of the response body)."""
+    import types
+    fake = types.ModuleType("dynamic_credentials")
+    fake.add_surrogate_to_request = lambda req, cred, allowed_hosts=(): None
+    fake.read_json_response = lambda resp: json.loads(resp.read().decode())
+    monkeypatch.setitem(sys.modules, "dynamic_credentials", fake)
+
+
 @pytest.fixture
 def state_dir(tmp_path, monkeypatch):
     d = tmp_path / "run"
