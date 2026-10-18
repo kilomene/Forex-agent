@@ -164,6 +164,7 @@ class _FakeResp:
     def __init__(self, payload):
         self.status = 200
         self._payload = json.dumps(payload).encode()
+        self._served = False
 
     def __enter__(self):
         return self
@@ -172,6 +173,9 @@ class _FakeResp:
         return False
 
     def read(self, size=-1):
+        if self._served:
+            return b""
+        self._served = True
         return self._payload if size in (-1, None) else self._payload[:size]
 
 
