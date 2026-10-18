@@ -40,16 +40,26 @@ import urllib.error
 import http.client
 from datetime import datetime, timezone
 
-# dynamic_credentials moved out of the old skill-creator path; probe the
-# live locations first, legacy path last.
-for _p in ("/opt/muse/skills/custom-connector-setup/bin",
-           "/opt/hatch/workflow-skills/custom-connector-setup/bin",
-           "/opt/hatch/skills/skill-creator/bin"):
-    if os.path.isdir(_p):
-        sys.path.insert(0, _p)
-        break
-from dynamic_credentials import (  # noqa: E402
-    add_surrogate_to_request, read_json_response)
+def _credentials():
+    """Lazy import of the host credential helper.
+
+    dynamic_credentials only exists on the Nova host (connector surrogate
+    auth); importing it at module level broke `import push_evidence` (and
+    therefore the test-suite collection) on any other machine, including
+    CI. It is only needed on the single code path that actually talks to
+    api.github.com, so it is imported here, on demand.
+    """
+    # dynamic_credentials moved out of the old skill-creator path; probe the
+    # live locations first, legacy path last.
+    for _p in ("/opt/muse/skills/custom-connector-setup/bin",
+               "/opt/hatch/workflow-skills/custom-connector-setup/bin",
+               "/opt/hatch/skills/skill-creator/bin"):
+        if os.path.isdir(_p):
+            sys.path.insert(0, _p)
+            break
+    from dynamic_credentials import (  # noqa: E402
+        add_surrogate_to_request, read_json_response)
+    return add_surrogate_to_request, read_json_response
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 STATE_DIR = os.environ.get("TRADER_STATE_DIR", os.path.join(BASE, "run"))
@@ -99,6 +109,7 @@ def gh_api(method, path, payload=None, timeout=60):
     so callers implement explicit status logic. Raises PushError only when
     the network stays down through all attempts.
     """
+    add_surrogate_to_request, read_json_response = _credentials()
     url = f"{API}{path}"
     data = json.dumps(payload).encode() if payload is not None else None
     last_exc = None
